@@ -336,6 +336,24 @@ services:
         echo "MinIO bucket 'fluss' ready."
     restart: "no"
 
+  # ── Phase 3: Paimon warehouse ownership fix ──────────────────────────────────
+  # Flink JVM runs as uid 9999 (flink); ensure the shared paimon-warehouse volume
+  # is writable by that user before the tiering job starts.
+
+  paimon-init:
+    image: busybox:latest
+    container_name: paimon-init
+    networks: [analytics]
+    volumes:
+      - paimon-warehouse:/tmp/paimon/warehouse
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /tmp/paimon/warehouse
+        chown -R 9999:9999 /tmp/paimon/warehouse
+        echo "paimon-warehouse ownership set to flink (9999)."
+    restart: "no"
+
   # ── Phase 3: Fluss — CoordinatorServer ───────────────────────────────────────
 
   coordinator-server:
@@ -441,7 +459,7 @@ services:
         taskmanager.numberOfTaskSlots: 8
         parallelism.default: 2
         heartbeat.interval: 1000
-        heartbeat.timeout: 120000
+        heartbeat.timeout: 300000
         state.checkpoints.dir: file:///tmp/flink-checkpoints
         rest.flamegraph.enabled: true
         sql-gateway.endpoint.rest.address: 0.0.0.0
@@ -489,7 +507,7 @@ services:
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 8
         heartbeat.interval: 1000
-        heartbeat.timeout: 120000
+        heartbeat.timeout: 300000
         state.checkpoints.dir: file:///tmp/flink-checkpoints
         s3.endpoint: http://minio:9000
         s3.access-key: minioadmin
@@ -507,6 +525,6 @@ services:
       resources:
         limits:
           cpus: '2.0'
-          memory: 3G
+          memory: 4G
     restart: unless-stopped
 
