@@ -9,6 +9,8 @@
 --   3. Creates a Kafka source table (in the default catalog, ephemeral)
 --   4. Submits a continuous streaming INSERT: Kafka → Fluss
 
+SET 'parallelism.default' = '1';
+
 -- ── Step 1: Fluss catalog ─────────────────────────────────────────────────────
 
 CREATE CATALOG IF NOT EXISTS fluss_catalog WITH (

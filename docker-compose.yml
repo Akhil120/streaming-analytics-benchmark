@@ -483,7 +483,7 @@ services:
       resources:
         limits:
           cpus: '1.0'
-          memory: 1500M
+          memory: 2G
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8081/overview && curl -sf http://localhost:8083/v1/info || exit 1"]
       interval: 10s
@@ -506,6 +506,7 @@ services:
         FLINK_PROPERTIES=
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 8
+        taskmanager.memory.process.size: 3500m
         heartbeat.interval: 1000
         heartbeat.timeout: 300000
         state.checkpoints.dir: file:///tmp/flink-checkpoints
