@@ -462,6 +462,7 @@ services:
         heartbeat.timeout: 300000
         state.checkpoints.dir: file:///tmp/flink-checkpoints
         rest.flamegraph.enabled: true
+        classloader.check-leaked-classloader: false
         sql-gateway.endpoint.rest.address: 0.0.0.0
         sql-gateway.endpoint.rest.port: 8083
         s3.endpoint: http://minio:9000
@@ -507,6 +508,7 @@ services:
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 8
         taskmanager.memory.process.size: 3500m
+        classloader.check-leaked-classloader: false
         heartbeat.interval: 1000
         heartbeat.timeout: 300000
         state.checkpoints.dir: file:///tmp/flink-checkpoints
