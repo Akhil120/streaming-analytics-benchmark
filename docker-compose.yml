@@ -273,15 +273,15 @@ services:
     environment:
       TZ: UTC
       ZOO_MY_ID: 1
-      ZOO_TICK_TIME: 4000
-      ZOO_CFG_EXTRA: "maxSessionTimeout=120000"
+      ZOO_TICK_TIME: 6000
+      ZOO_CFG_EXTRA: "maxSessionTimeout=300000"
     volumes:
       - zookeeper-data:/data
     deploy:
       resources:
         limits:
-          cpus: '0.5'
-          memory: 512M
+          cpus: '1.0'
+          memory: 1G
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'cat /dev/null > /dev/tcp/localhost/2181' || exit 1"]
       interval: 10s
@@ -348,7 +348,7 @@ services:
       TZ: UTC
       FLUSS_PROPERTIES: |
         zookeeper.address: zookeeper:2181
-        zookeeper.session.timeout: 90000
+        zookeeper.client.session-timeout: 120000
         bind.listeners: FLUSS://coordinator-server:9123
         remote.data.dir: s3://fluss/remote-data
         s3.endpoint: http://minio:9000
@@ -396,7 +396,7 @@ services:
       TZ: UTC
       FLUSS_PROPERTIES: |
         zookeeper.address: zookeeper:2181
-        zookeeper.session.timeout: 90000
+        zookeeper.client.session-timeout: 120000
         bind.listeners: FLUSS://tablet-server:9123
         tablet-server.id: 1
         data.dir: /tmp/fluss/data

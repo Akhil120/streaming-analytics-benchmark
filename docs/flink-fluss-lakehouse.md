@@ -84,7 +84,15 @@ Fluss tablet-server (KvStore snapshot)
 
 An earlier design used a `paimon-warehouse` Docker named volume with a `paimon-init` busybox container to `chown -R 9999 /tmp/paimon/warehouse` so the Flink JVM (uid 9999) could write. This worked once but broke after every `make clean`: `restart: "no"` containers are not restarted by subsequent `docker compose up`, so the volume was recreated as root-owned and every tiering epoch failed immediately with `Mkdirs failed to create .../bucket-0`.
 
-Using `s3://fluss/paimon-warehouse` on MinIO eliminates the ownership problem entirely — MinIO has no POSIX permissions, and the bucket survives `make clean` cycles if you only recreate volumes rather than the bucket.
+Using `s3://fluss/paimon-warehouse` on MinIO eliminates the ownership problem entirely — MinIO has no POSIX permissions, and the bucket survives `make clean` cycles.
+
+### Why `paimon-s3-1.3.1.jar` is mounted into the Fluss image
+
+The stock `apache/fluss:0.9.1-incubating` image ships `paimon-bundle-1.3.1.jar` in `/opt/fluss/plugins/paimon/` but it only contains `LocalFileIO` and `HadoopFileIO` — no S3 FileIO. Without it, coordinator-server crashes immediately with `UnsupportedSchemeException: Could not find a file io implementation for scheme 's3'`.
+
+`docker/fluss/paimon-s3-1.3.1.jar` (downloaded from Maven Central) is bind-mounted into `/opt/fluss/plugins/paimon/` on both coordinator-server and tablet-server. Paimon's ServiceLoader then finds `S3FileIO` for the `s3://` scheme.
+
+The `datalake.paimon.s3.*` properties in FLUSS_PROPERTIES pass MinIO credentials **directly to Paimon's S3FileIO** — these are separate from the Fluss-level `s3.*` properties which configure Fluss's own remote log segment storage.
 
 ---
 
@@ -99,6 +107,14 @@ Built from `docker/flink/Dockerfile`. Key additions on top of `apache/fluss-quic
 ---
 
 ## Critical Configuration
+
+### `zookeeper.client.session-timeout: 120000`
+
+Set on both coordinator-server and tablet-server. The correct Fluss config key for the raw ZooKeeper session timeout is `zookeeper.client.session-timeout`, **not** `zookeeper.session.timeout` (which controls Curator retry behavior but is ignored by the ZK client). Without this, Curator uses its built-in default of 60 seconds.
+
+On macOS Docker Desktop, both Fluss clients can lose ZK connectivity for 40–45 seconds simultaneously (VM scheduler/network jitter). With a 60-second session the read timeout is `2/3 × 60s = 40s`, exactly hitting the issue. Setting to 120 seconds makes the read timeout 80 seconds, which survives the transient gaps.
+
+Also relevant: ZooKeeper is configured with `ZOO_TICK_TIME: 6000` and `maxSessionTimeout=300000` to honor long sessions, plus 1 CPU / 1G memory to prevent GC-induced response delays.
 
 ### `classloader.check-leaked-classloader: false`
 
