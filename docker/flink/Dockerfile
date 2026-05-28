@@ -2,10 +2,15 @@ FROM apache/fluss-quickstart-flink:1.20-0.9.1-incubating
 
 # Copy Paimon lake JARs into the Flink lib dir so Union Read and $lake queries work.
 # Exclude hadoop-apache-3.3.5-2.jar (44MB, conflicts with Flink's shaded Hadoop)
-# and paimon-s3 (not needed — warehouse is on local filesystem, not S3).
+# paimon-s3 from the image has classes under paimon-plugin-s3/ prefix (wrong for lib);
+# we bind-mount the Maven Central version (flat classpath structure) at runtime instead.
 RUN cp /opt/flink/paimon/fluss-lake-paimon-0.9.1-incubating.jar /opt/flink/lib/ && \
-    cp /opt/flink/paimon/paimon-flink-1.20-1.3.1.jar /opt/flink/lib/ && \
-    cp /opt/flink/paimon/paimon-s3-1.3.1.jar /opt/flink/lib/
+    cp /opt/flink/paimon/paimon-flink-1.20-1.3.1.jar /opt/flink/lib/
+
+# Activate the Flink S3 Hadoop plugin so FlinkFileIOLoader can access s3:// paths
+# (used by Paimon SQL queries — e.g. transactions$lake — via the Flink filesystem layer).
+RUN mkdir -p /opt/flink/plugins/flink-s3-fs-hadoop && \
+    cp /opt/flink/opt/flink-s3-fs-hadoop-1.20.0.jar /opt/flink/plugins/flink-s3-fs-hadoop/
 
 # PaimonCatalogProvider requires HdfsConfiguration (hadoop-hdfs-client) unconditionally.
 # The bundled hadoop-apache-3.3.5-2.jar in /opt/flink/paimon/ includes Scala classes

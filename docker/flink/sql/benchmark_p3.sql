@@ -4,13 +4,13 @@
 -- compacted Parquet files in MinIO. This is a pure batch columnar scan.
 --
 -- Cold data availability: the Lakehouse Tiering Service flushes hot → cold
--- every `table.datalake.freshness` interval (set to 30s in 01_kafka_to_fluss.sql).
--- Allow ~60–120s after ingestion starts before cold data appears.
+-- every `table.datalake.freshness` interval (set to 2m in 01_kafka_to_fluss.sql).
+-- Allow ~3–5 min after ingestion starts before cold data appears.
 --
 -- Run via: make flink-p3
 -- Or interactively: make flink-sql → paste statements one at a time
 --
--- Expected: freshness_lag_ms ≈ 1800000ms+ (30-min tiering epoch at this data volume)
+-- Expected: freshness_lag_ms ≈ 120000ms+ (2-min tiering epoch)
 
 CREATE CATALOG IF NOT EXISTS fluss_catalog WITH (
     'type'              = 'fluss',
@@ -53,9 +53,10 @@ LIMIT 120;
 -- ── Q3: Freshness probe (cold lake only — measures compaction lag) ─────────────
 
 SELECT
-    MAX(event_time)                                                  AS newest_event_time,
-    CURRENT_TIMESTAMP                                                AS query_time,
-    TIMESTAMPDIFF(SECOND, MAX(event_time), CURRENT_TIMESTAMP) * 1000  AS freshness_lag_ms,
-    TIMESTAMPDIFF(SECOND, MAX(event_time), MAX(ingest_time)) * 1000   AS pipeline_lag_ms,
-    COUNT(*)                                                         AS total_rows
+    MAX(event_time)                                                         AS newest_event_time,
+    CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3))                                 AS query_time,
+    TIMESTAMPDIFF(SECOND, MAX(event_time), CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3))) * 1000
+                                                                            AS freshness_lag_ms,
+    TIMESTAMPDIFF(SECOND, MAX(event_time), MAX(ingest_time)) * 1000        AS pipeline_lag_ms,
+    COUNT(*)                                                                AS total_rows
 FROM `transactions$lake`;

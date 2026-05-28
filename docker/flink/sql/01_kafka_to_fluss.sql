@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     PRIMARY KEY (event_id) NOT ENFORCED
 ) WITH (
     'table.datalake.enabled'   = 'true',
-    'table.datalake.freshness' = '30m'
+    'table.datalake.freshness' = '2m'
 );
 
 -- ── Step 3: Kafka source (ephemeral, in the default catalog) ──────────────────

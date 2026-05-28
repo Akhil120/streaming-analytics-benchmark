@@ -51,9 +51,10 @@ LIMIT 120;
 -- ── Q3: Freshness probe (Union Read — reads newest data across hot+cold) ──────
 
 SELECT
-    MAX(event_time)                                                  AS newest_event_time,
-    CURRENT_TIMESTAMP                                                AS query_time,
-    TIMESTAMPDIFF(SECOND, MAX(event_time), CURRENT_TIMESTAMP) * 1000  AS freshness_lag_ms,
-    TIMESTAMPDIFF(SECOND, MAX(event_time), MAX(ingest_time)) * 1000   AS pipeline_lag_ms,
-    COUNT(*)                                                         AS total_rows
+    MAX(event_time)                                                         AS newest_event_time,
+    CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3))                                 AS query_time,
+    TIMESTAMPDIFF(SECOND, MAX(event_time), CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3))) * 1000
+                                                                            AS freshness_lag_ms,
+    TIMESTAMPDIFF(SECOND, MAX(event_time), MAX(ingest_time)) * 1000        AS pipeline_lag_ms,
+    COUNT(*)                                                                AS total_rows
 FROM transactions;

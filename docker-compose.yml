@@ -348,7 +348,7 @@ services:
       TZ: UTC
       FLUSS_PROPERTIES: |
         zookeeper.address: zookeeper:2181
-        zookeeper.client.session-timeout: 120000
+        zookeeper.client.session-timeout: 120000ms
         bind.listeners: FLUSS://coordinator-server:9123
         remote.data.dir: s3://fluss/remote-data
         s3.endpoint: http://minio:9000
@@ -396,7 +396,7 @@ services:
       TZ: UTC
       FLUSS_PROPERTIES: |
         zookeeper.address: zookeeper:2181
-        zookeeper.client.session-timeout: 120000
+        zookeeper.client.session-timeout: 120000ms
         bind.listeners: FLUSS://tablet-server:9123
         tablet-server.id: 1
         data.dir: /tmp/fluss/data
@@ -463,6 +463,7 @@ services:
         s3.assumed.role.sts.endpoint: http://minio:9000
     volumes:
       - ./docker/flink/sql:/sql
+      - ./docker/fluss/paimon-s3-1.3.1.jar:/opt/flink/lib/paimon-s3-1.3.1.jar:ro
     depends_on:
       coordinator-server:
         condition: service_healthy
@@ -507,6 +508,8 @@ services:
         s3.region: us-east-1
         s3.assumed.role.arn: arn:aws:iam::000000000000:role/minioadmin
         s3.assumed.role.sts.endpoint: http://minio:9000
+    volumes:
+      - ./docker/fluss/paimon-s3-1.3.1.jar:/opt/flink/lib/paimon-s3-1.3.1.jar:ro
     depends_on:
       flink-jobmanager:
         condition: service_healthy
