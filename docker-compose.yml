@@ -9,7 +9,6 @@ volumes:
   zookeeper-data:
   minio-data:
   fluss-data:
-  paimon-warehouse:
 
 services:
 
@@ -336,24 +335,6 @@ services:
         echo "MinIO bucket 'fluss' ready."
     restart: "no"
 
-  # ── Phase 3: Paimon warehouse ownership fix ──────────────────────────────────
-  # Flink JVM runs as uid 9999 (flink); ensure the shared paimon-warehouse volume
-  # is writable by that user before the tiering job starts.
-
-  paimon-init:
-    image: busybox:latest
-    container_name: paimon-init
-    networks: [analytics]
-    volumes:
-      - paimon-warehouse:/tmp/paimon/warehouse
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        mkdir -p /tmp/paimon/warehouse
-        chown -R 9999:9999 /tmp/paimon/warehouse
-        echo "paimon-warehouse ownership set to flink (9999)."
-    restart: "no"
-
   # ── Phase 3: Fluss — CoordinatorServer ───────────────────────────────────────
 
   coordinator-server:
@@ -379,9 +360,7 @@ services:
         s3.assumed.role.sts.endpoint: http://minio:9000
         datalake.format: paimon
         datalake.paimon.metastore: filesystem
-        datalake.paimon.warehouse: /tmp/paimon/warehouse
-    volumes:
-      - paimon-warehouse:/tmp/paimon/warehouse
+        datalake.paimon.warehouse: s3://fluss/paimon-warehouse
     depends_on:
       zookeeper:
         condition: service_healthy
@@ -425,10 +404,9 @@ services:
         s3.assumed.role.sts.endpoint: http://minio:9000
         datalake.format: paimon
         datalake.paimon.metastore: filesystem
-        datalake.paimon.warehouse: /tmp/paimon/warehouse
+        datalake.paimon.warehouse: s3://fluss/paimon-warehouse
     volumes:
       - fluss-data:/tmp/fluss
-      - paimon-warehouse:/tmp/paimon/warehouse
     depends_on:
       coordinator-server:
         condition: service_healthy
@@ -474,7 +452,6 @@ services:
         s3.assumed.role.sts.endpoint: http://minio:9000
     volumes:
       - ./docker/flink/sql:/sql
-      - paimon-warehouse:/tmp/paimon/warehouse
     depends_on:
       coordinator-server:
         condition: service_healthy
@@ -519,8 +496,6 @@ services:
         s3.region: us-east-1
         s3.assumed.role.arn: arn:aws:iam::000000000000:role/minioadmin
         s3.assumed.role.sts.endpoint: http://minio:9000
-    volumes:
-      - paimon-warehouse:/tmp/paimon/warehouse
     depends_on:
       flink-jobmanager:
         condition: service_healthy

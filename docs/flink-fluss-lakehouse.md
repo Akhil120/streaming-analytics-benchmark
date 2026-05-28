@@ -73,17 +73,18 @@ Fluss tablet-server (KvStore snapshot)
 | Container | Image | Role |
 |---|---|---|
 | `zookeeper` | `zookeeper:3.9.2` | Fluss cluster metadata + leader election |
-| `minio` | `minio/minio` | S3-compatible object store for Fluss remote log segments |
+| `minio` | `minio/minio` | S3-compatible object store for Fluss remote log segments **and** Paimon warehouse |
 | `minio-init` | `minio/mc` | One-shot: creates `fluss` bucket |
 | `coordinator-server` | `apache/fluss:0.9.1-incubating` | Fluss cluster coordinator — manages tablet assignment, lake snapshot commits |
 | `tablet-server` | `apache/fluss:0.9.1-incubating` | Stores hot data (Arrow/KvStore/LogStore), handles Fluss reads/writes |
-| `paimon-init` | `busybox` | One-shot: `chown -R 9999 /tmp/paimon/warehouse` so the `flink` JVM user can write |
 | `flink-jobmanager` | (local build) | Flink JM + SQL Gateway (port 8083) |
 | `flink-taskmanager` | (local build) | Flink TM — runs both the ingestion job and tiering job |
 
-### Why `paimon-init` is needed
+### Why the Paimon warehouse is on MinIO, not a local volume
 
-The `paimon-warehouse` Docker named volume is owned by `root` when first created. The Flink JVM runs as the `flink` user (uid 9999) inside the container. Without the `chown`, the tiering job will write a few files then fail with `Permission denied` on the second write (after the initial directory is created by the JVM).
+An earlier design used a `paimon-warehouse` Docker named volume with a `paimon-init` busybox container to `chown -R 9999 /tmp/paimon/warehouse` so the Flink JVM (uid 9999) could write. This worked once but broke after every `make clean`: `restart: "no"` containers are not restarted by subsequent `docker compose up`, so the volume was recreated as root-owned and every tiering epoch failed immediately with `Mkdirs failed to create .../bucket-0`.
+
+Using `s3://fluss/paimon-warehouse` on MinIO eliminates the ownership problem entirely — MinIO has no POSIX permissions, and the bucket survives `make clean` cycles if you only recreate volumes rather than the bucket.
 
 ---
 
@@ -93,7 +94,7 @@ Built from `docker/flink/Dockerfile`. Key additions on top of `apache/fluss-quic
 
 - `flink-sql-connector-kafka-3.4.0-1.20.jar` — Kafka source for the ingestion job
 - `paimon-flink-1.20-0.9.0.jar` — Paimon table format for the tiering writer
-- `hadoop-client-api-3.3.6.jar` + `hadoop-hdfs-client-3.3.6.jar` — Hadoop FileSystem API used by Paimon to access the local warehouse path
+- `hadoop-client-api-3.3.6.jar` + `hadoop-hdfs-client-3.3.6.jar` — Hadoop FileSystem API used by Paimon for S3 warehouse access
 
 ---
 
@@ -110,7 +111,7 @@ IllegalStateException: Trying to access closed classloader. This can happen when
 
 Root cause: Paimon uses Hadoop's `Configuration`, which lazily loads XML resources. By the time Paimon reads Parquet column stats during the `TieringCommitter.commit()` call, Flink's safety net wrapper has already closed the job classloader. Setting this flag suppresses the safety net check, which is safe here since the access is benign.
 
-### `table.datalake.freshness: 10m`
+### `table.datalake.freshness: 30m`
 
 Set on the Fluss `transactions` table (in `01_kafka_to_fluss.sql`). This property controls **both** the tiering epoch interval and the per-epoch max duration. Setting it too low causes every tiering epoch to fail: the Fluss KV snapshot download alone takes 40–70 seconds (grows with data volume), and if `table.datalake.freshness` is shorter than that, the tiering service fires a `TieringReachMaxDurationEvent` during the download phase, the epoch is abandoned without writing any Parquet files, and `snapshot/` never appears in the warehouse.
 
@@ -194,14 +195,16 @@ SELECT COUNT(*) FROM transactions;
 ### Cold layer — Parquet files
 
 ```bash
-docker compose exec flink-jobmanager ls /tmp/paimon/warehouse/analytics.db/transactions/bucket-0/ | head
+docker compose exec minio mc ls local/fluss/paimon-warehouse/analytics.db/transactions/bucket-0/ 2>/dev/null | head
 # Should show data-*.parquet and changelog-*.parquet files
 ```
+
+Or via the MinIO console at http://localhost:9001 → browse `fluss/paimon-warehouse/analytics.db/transactions/`.
 
 ### Cold layer — Paimon snapshot (required for P3)
 
 ```bash
-docker compose exec flink-jobmanager ls /tmp/paimon/warehouse/analytics.db/transactions/snapshot/
+docker compose exec minio mc ls local/fluss/paimon-warehouse/analytics.db/transactions/snapshot/ 2>/dev/null
 # Expected: LATEST  snapshot-1  snapshot-2 ...
 ```
 
@@ -268,17 +271,13 @@ Several standard SQL constructs work differently in Flink SQL:
 
 ## Common Failures
 
-### `Permission denied` writing Parquet files
+### `Mkdirs failed` / tiering epochs always failing
 
-Symptom: tiering job runs but fails on second or third write attempt.
+Symptom: every epoch shows up in `currentFailedTableEpochs` immediately; JM logs show `Mkdirs failed to create .../bucket-0`.
 
-Root cause: `paimon-warehouse` volume owned by root; Flink JVM runs as `flink` (uid 9999).
+Root cause: This is the historical failure mode from when the Paimon warehouse was stored on a Docker named volume (`paimon-warehouse`). The volume is owned by root on creation; the Flink JVM (uid 9999) could not create directories. A `paimon-init` container would `chown` it once, but `restart: "no"` containers don't re-run after `make clean` — so every fresh stack was broken.
 
-Fix: The `paimon-init` busybox container in `docker-compose.yml` runs `chown -R 9999:9999 /tmp/paimon/warehouse` at startup. If the volume was created before `paimon-init` ran, recreate it:
-
-```bash
-make clean && make up
-```
+**This is no longer an issue**: the warehouse now lives at `s3://fluss/paimon-warehouse` (MinIO), which has no filesystem ownership constraints. If you see this error on an old checkout, do `make clean && make up` to pick up the updated config.
 
 ### `NoAwsCredentialsException: Dynamic session credentials for Fluss`
 
@@ -358,9 +357,9 @@ docker/flink/
     └── benchmark_p3.sql           — P3 queries: cold lake only ($lake suffix)
 ```
 
-Paimon warehouse (inside containers, named Docker volume):
+Paimon warehouse (MinIO at `s3://fluss/paimon-warehouse`):
 ```
-/tmp/paimon/warehouse/analytics.db/transactions/
+fluss/paimon-warehouse/analytics.db/transactions/
 ├── schema/schema-0
 ├── snapshot/
 │   ├── LATEST
@@ -373,3 +372,5 @@ Paimon warehouse (inside containers, named Docker volume):
     ├── data-<uuid>-1.parquet
     └── changelog-<uuid>-0.parquet
 ```
+
+Browse via MinIO console: http://localhost:9001 → `fluss` → `paimon-warehouse/`
