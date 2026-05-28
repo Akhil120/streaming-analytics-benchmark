@@ -55,7 +55,7 @@ LIMIT 120;
 SELECT
     MAX(event_time)                                                  AS newest_event_time,
     CURRENT_TIMESTAMP                                                AS query_time,
-    TIMESTAMPDIFF(MILLISECOND, MAX(event_time), CURRENT_TIMESTAMP)  AS freshness_lag_ms,
-    TIMESTAMPDIFF(MILLISECOND, MAX(event_time), MAX(ingest_time))   AS pipeline_lag_ms,
+    TIMESTAMPDIFF(SECOND, MAX(event_time), CURRENT_TIMESTAMP) * 1000  AS freshness_lag_ms,
+    TIMESTAMPDIFF(SECOND, MAX(event_time), MAX(ingest_time)) * 1000   AS pipeline_lag_ms,
     COUNT(*)                                                         AS total_rows
 FROM `transactions$lake`;

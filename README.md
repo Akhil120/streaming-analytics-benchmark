@@ -50,6 +50,8 @@ Analytics/
 ├── PATTERNS.md                  ← full architectural documentation for all 6 patterns
 ├── Makefile                     ← all operational commands
 ├── docker-compose.yml           ← all services (grows per phase)
+├── docs/
+│   └── flink-fluss-lakehouse.md ← deep dive: Flink+Fluss+Paimon setup, config, failures
 └── docker/
     ├── generator/
     │   ├── Dockerfile
@@ -486,6 +488,8 @@ Expected — minor clock skew between Docker containers (generator clock slightl
 
 ## Phase 3 — Flink + Fluss (Patterns 2 & 3)
 
+> **Full setup details, failure modes, and configuration reference:** [docs/flink-fluss-lakehouse.md](./docs/flink-fluss-lakehouse.md)
+
 ### Containers
 
 | Container | Image | Purpose |
@@ -624,7 +628,7 @@ Key dialect differences from standard SQL:
 | Concept | Standard SQL | Flink SQL |
 |---|---|---|
 | Current timestamp | `NOW()` | `CURRENT_TIMESTAMP` or `NOW()` |
-| Date diff in ms | `DATEDIFF('ms', a, b)` | `TIMESTAMPDIFF(MILLISECOND, a, b)` |
+| Date diff in ms | `DATEDIFF('ms', a, b)` | `TIMESTAMPDIFF(SECOND, a, b) * 1000` — `MILLISECOND` is not a valid unit |
 | Tumbling window | `TUMBLE(ts, INTERVAL '1' MINUTE)` | `FLOOR(ts TO MINUTE)` (batch mode) |
 | Cold layer only | N/A | `\`table$lake\`` suffix |
 
@@ -651,11 +655,11 @@ USE CATALOG fluss_catalog; USE analytics;
 SET 'execution.runtime-mode' = 'BATCH';
 
 SELECT
-    MAX(event_time)                                                  AS newest_event_time,
-    CURRENT_TIMESTAMP                                                AS query_time,
-    TIMESTAMPDIFF(MILLISECOND, MAX(event_time), CURRENT_TIMESTAMP)  AS freshness_lag_ms,
-    TIMESTAMPDIFF(MILLISECOND, MAX(event_time), MAX(ingest_time))   AS pipeline_lag_ms,
-    COUNT(*)                                                         AS total_rows
+    MAX(event_time)                                                    AS newest_event_time,
+    CURRENT_TIMESTAMP                                                  AS query_time,
+    TIMESTAMPDIFF(SECOND, MAX(event_time), CURRENT_TIMESTAMP) * 1000  AS freshness_lag_ms,
+    TIMESTAMPDIFF(SECOND, MAX(event_time), MAX(ingest_time)) * 1000   AS pipeline_lag_ms,
+    COUNT(*)                                                           AS total_rows
 FROM transactions;
 ```
 
