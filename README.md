@@ -12,7 +12,7 @@ Full architectural decisions and pattern analysis: [PATTERNS.md](./PATTERNS.md).
 |---|---|---|---|
 | P1 | ClickHouse ← Kafka Engine | 1–10s | Batch (re-run) |
 | P2 | Flink SQL on Fluss (Union Read: hot + cold) | ~500ms–3s | Batch (re-run on live table) |
-| P3 | Flink SQL on Fluss cold lake only (`$lake`) | ~30s–2min | Batch (Parquet columnar scan) |
+| P3 | Flink SQL on Fluss cold lake only (`$lake`) | ~30min+ | Batch (Parquet columnar scan) |
 | P4 | StarRocks ← Fluss Paimon catalog | 5–30 min | Batch (re-run) |
 | P5 | StarRocks ← Flink streaming write | 2–10s | Batch (re-run, live data) |
 | P6 | StarRocks ← Kafka Routine Load | 1–5s | Batch (re-run) |
@@ -519,7 +519,7 @@ Kafka topic: transactions
       │  Lakehouse Tiering Service — automatic flush every 30s
       ▼
    MinIO / S3 bucket: fluss/remote-data
-   (Parquet files — compacted, columnar)
+   (Parquet files — compacted, columnar, tiered every 30min)
       │
       ├──────────────────────────┐
       ▼                          ▼

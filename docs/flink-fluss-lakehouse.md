@@ -32,7 +32,7 @@ This setup is significantly more complex than ClickHouse or StarRocks Routine Lo
 │  │  Hot Layer               │      │  Cold Layer (Paimon)             │ │
 │  │  KvStore + LogStore      │      │  Parquet snapshots               │ │
 │  │  Arrow format, RAM       │      │  /tmp/paimon/warehouse/          │ │
-│  │  Sub-second freshness    │      │  Tiered every 30s                │ │
+│  │  Sub-second freshness    │      │  Tiered every 30m                │ │
 │  └──────────────────────────┘      └──────────────────────────────────┘ │
 │                │                                  │                      │
 │                └──────────Union Read──────────────┘                      │
@@ -41,7 +41,7 @@ This setup is significantly more complex than ClickHouse or StarRocks Routine Lo
          ▼                                    ▼
   P2: query `transactions`           P3: query `transactions$lake`
   (Union Read: hot + cold)           (cold Parquet scan only)
-  freshness: ~500ms – 3s             freshness: ~30s – 2min
+  freshness: ~500ms – 3s             freshness: ~30min+
 ```
 
 ### Tiering service (separate Flink job)
@@ -109,6 +109,14 @@ IllegalStateException: Trying to access closed classloader. This can happen when
 ```
 
 Root cause: Paimon uses Hadoop's `Configuration`, which lazily loads XML resources. By the time Paimon reads Parquet column stats during the `TieringCommitter.commit()` call, Flink's safety net wrapper has already closed the job classloader. Setting this flag suppresses the safety net check, which is safe here since the access is benign.
+
+### `table.datalake.freshness: 10m`
+
+Set on the Fluss `transactions` table (in `01_kafka_to_fluss.sql`). This property controls **both** the tiering epoch interval and the per-epoch max duration. Setting it too low causes every tiering epoch to fail: the Fluss KV snapshot download alone takes 40–70 seconds (grows with data volume), and if `table.datalake.freshness` is shorter than that, the tiering service fires a `TieringReachMaxDurationEvent` during the download phase, the epoch is abandoned without writing any Parquet files, and `snapshot/` never appears in the warehouse.
+
+**Why not `30s`** (the Fluss quickstart default): after even 30 minutes of generator traffic at ~3K msgs/sec, the accumulated KV snapshot is large enough that the download alone exceeds 30 seconds, causing every epoch to fail before any Parquet files are written. With `30m`, the download (35–70s) and Paimon sort+write (10–20 min for ~20M rows) both fit within the window.
+
+Cold-lake benchmark `freshness_lag_ms` will reflect the 30-minute epoch cadence. This is a consequence of data volume, not a fundamental Fluss limitation — a smaller or partitioned table would tier far faster.
 
 ### `taskmanager.memory.process.size: 3500m`
 

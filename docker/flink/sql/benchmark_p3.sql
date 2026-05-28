@@ -10,7 +10,7 @@
 -- Run via: make flink-p3
 -- Or interactively: make flink-sql → paste statements one at a time
 --
--- Expected: freshness_lag_ms ≈ 30000–120000ms (cold compaction interval)
+-- Expected: freshness_lag_ms ≈ 1800000ms+ (30-min tiering epoch at this data volume)
 
 CREATE CATALOG IF NOT EXISTS fluss_catalog WITH (
     'type'              = 'fluss',
