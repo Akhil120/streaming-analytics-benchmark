@@ -10,6 +10,7 @@ SQL_GATEWAY := http://localhost:8083
         flink-p2 flink-p3 \
         minio \
         sr sr-query sr-init sr-p4 sr-freshness \
+        sr-p6-init sr-p6-status sr-p6 sr-p6-freshness \
         ui grafana prometheus smoke-test
 
 # Start all Phase 1 services
@@ -171,6 +172,33 @@ sr-init:
 sr-p4:
 	docker compose exec -T starrocks mysql -h 127.0.0.1 -P 9030 -u root \
 	    < docker/starrocks/queries/benchmark_p4.sql
+
+# ── StarRocks (Phase 4 — P6: Routine Load) ───────────────────────────────────
+
+# Create analytics DB, transactions_p6 table, and Routine Load job (run once)
+sr-p6-init:
+	docker compose exec -T starrocks mysql -h 127.0.0.1 -P 9030 -u root \
+	    < docker/starrocks/init/02_p6_setup.sql
+	@echo "P6 table + Routine Load job created."
+
+# Show Routine Load job state (running, lag, error rows)
+sr-p6-status:
+	docker compose exec starrocks mysql -h 127.0.0.1 -P 9030 -u root -e \
+	    "SHOW ROUTINE LOAD FOR analytics.transactions_p6_load\G"
+
+# Run P6 benchmark queries (Q1/Q2/Q3 on native StarRocks PK table)
+sr-p6:
+	docker compose exec -T starrocks mysql -h 127.0.0.1 -P 9030 -u root \
+	    < docker/starrocks/queries/benchmark_p6.sql
+
+# Q3 freshness probe on P6 table
+sr-p6-freshness:
+	docker compose exec starrocks mysql -h 127.0.0.1 -P 9030 -u root -e \
+	    "SELECT MAX(event_time) AS newest_event_time, NOW() AS query_time, \
+	     TIMESTAMPDIFF(SECOND, MAX(event_time), NOW()) * 1000 AS freshness_lag_ms, \
+	     TIMESTAMPDIFF(SECOND, MAX(event_time), MAX(ingest_time)) * 1000 AS pipeline_lag_ms, \
+	     COUNT(*) AS total_rows \
+	     FROM analytics.transactions_p6"
 
 # Q3 freshness probe only
 sr-freshness:

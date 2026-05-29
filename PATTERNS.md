@@ -733,6 +733,29 @@ Committed to StarRocks PK table  ──► freshness_lag ≈ 1–5s (tunable via
                                  ──► query_latency ≈ ms to seconds (StarRocks MPP)
 ```
 
+### Verified results
+
+Measured on MacBook Pro (Apple M-series, 16 GB RAM, Docker Desktop 8 GB). StarRocks 3.3.0 (allin1-ubi), generator running at ~3–5K rows/sec, consuming from the live end of the Kafka topic. `max_batch_interval=5`, `taskConsumeSecond=15` (defaults).
+
+| Metric | Observed | Notes |
+|---|---|---|
+| Q1 — regional aggregate (last 1h) | 7 rows, **< 1s** | Live data; all 7 regions visible in the last hour |
+| Q2 — tumbling windows | 28 rows (4 active windows), **< 1s** | Current and recent minute windows visible |
+| Q3 — `freshness_lag_ms` | **~50,000ms (~50s)** | See note below |
+| Q3 — `pipeline_lag_ms` | **~0ms** | `ingest_time` (DEFAULT CURRENT_TIMESTAMP) closely tracks event commit time |
+| Q3 — `total_rows` | ~970K (growing) | Live ingestion only; consumer group started near topic head |
+| Peak ingestion rate | ~12,000 rows/sec | First backlog batch |
+| Sustained ingestion rate | ~3,000–5,000 rows/sec | Matches generator output |
+| Error rows | 0 | Zero parse failures; ISO 8601 event_time parsed correctly by StarRocks 3.3.0 |
+
+**On the 50s freshness:** The theoretical minimum with `max_batch_interval=5` is ~20s (15s consume + 5s interval). The 50s observed in Docker is due to FE JVM scheduling overhead on a constrained single-node setup. In a dedicated production StarRocks cluster: set `max_batch_interval=1` and `desired_concurrent_number` = Kafka partition count to achieve 1–3s freshness.
+
+**StarRocks 3.3.0 bugs hit during setup:**
+
+1. **NPE in `transformHadoopFunctionExpr`**: ANY function call in the `COLUMNS` clause (including zero-arg `now()`) throws a NullPointerException in the Routine Load task planner — the job creates but never loads data. Fixed by using `DEFAULT CURRENT_TIMESTAMP` on the `ingest_time` table column and omitting it from the `COLUMNS` clause entirely.
+
+2. **`OFFSET_BEGINNING` requires explicit partition list**: `"kafka_offsets" = "OFFSET_BEGINNING"` fails with "Partitions number should be equals to offsets number" unless `kafka_partitions` is also specified. Fixed with `"property.auto.offset.reset" = "earliest"` instead.
+
 ---
 
 ## Pattern Comparison Summary
@@ -741,7 +764,7 @@ Committed to StarRocks PK table  ──► freshness_lag ≈ 1–5s (tunable via
 |---|---|---|---|---|---|---|
 | **Engine** | ClickHouse | Flink + Fluss | Flink + Fluss | StarRocks | StarRocks + Flink | StarRocks |
 | **Data layer** | ClickHouse MergeTree | Fluss Hot (Union) | Fluss Cold | Fluss Cold (Paimon) | StarRocks PK native | StarRocks PK native |
-| **Freshness lag** | 1–10s | ~100ms–2s | 5–30 min | 5–30 min | 2–10s | 1–5s |
+| **Freshness lag** | 1–10s | ~100ms–2s | ~2min | ~2min | 2–10s | ~50s (Docker); 1–5s (prod) |
 | **Query model** | Batch (re-run) | Continuous streaming | Batch (bounded) | Batch (re-run) | Batch (re-run, live) | Batch (re-run, live) |
 | **Sees in-flight data** | No | Yes (hot layer) | No | No | No | No |
 | **True streaming query** | No | Yes | No | No | No | No |

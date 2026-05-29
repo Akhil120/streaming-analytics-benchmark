@@ -13,9 +13,9 @@ Full architectural decisions and pattern analysis: [PATTERNS.md](./PATTERNS.md).
 | P1 | ClickHouse ← Kafka Engine | 1–10s | Batch (re-run) |
 | P2 | Flink SQL on Fluss (Union Read: hot + cold) | ~500ms–3s | Batch (re-run on live table) |
 | P3 | Flink SQL on Fluss cold lake only (`$lake`) | ~2min | Batch (Parquet columnar scan) |
-| P4 | StarRocks ← Fluss Paimon catalog | 5–30 min | Batch (re-run) |
+| P4 | StarRocks ← Fluss Paimon catalog | ~2min | Batch (re-run) |
 | P5 | StarRocks ← Flink streaming write | 2–10s | Batch (re-run, live data) |
-| P6 | StarRocks ← Kafka Routine Load | 1–5s | Batch (re-run) |
+| P6 | StarRocks ← Kafka Routine Load | ~50s (Docker); 1–5s (prod) | Batch (re-run) |
 
 Three metrics captured per pattern per query:
 
@@ -75,9 +75,11 @@ Analytics/
     │       └── benchmark_p3.sql       ← Q1/Q2/Q3 via cold lake only ($lake suffix)
     ├── starrocks/
     │   ├── init/
-    │   │   └── 01_catalog.sql    ← CREATE EXTERNAL CATALOG paimon_catalog (run once via sr-init)
+    │   │   ├── 01_catalog.sql    ← CREATE EXTERNAL CATALOG paimon_catalog (run once via sr-init)
+    │   │   └── 02_p6_setup.sql   ← CREATE TABLE transactions_p6 + Routine Load job (sr-p6-init)
     │   └── queries/
-    │       └── benchmark_p4.sql  ← Q1/Q2/Q3 in StarRocks dialect
+    │       ├── benchmark_p4.sql  ← Q1/Q2/Q3 against paimon_catalog (StarRocks dialect)
+    │       └── benchmark_p6.sql  ← Q1/Q2/Q3 against analytics.transactions_p6
     ├── prometheus/
     │   └── prometheus.yml
     └── grafana/
@@ -878,7 +880,7 @@ Measured on MacBook Pro (Apple M-series, 16 GB RAM, Docker Desktop 8 GB). ~2.1M 
 | Q3 — `total_rows` | 2,145,583 |
 | **vs Flink P3 Q2** | **~10× faster** (StarRocks 14s vs Flink 132s, similar row count) |
 
-### StarRocks commands
+### StarRocks commands (P4)
 
 ```bash
 make sr                                    # interactive MySQL client
@@ -911,6 +913,99 @@ make sr-query Q="SET new_planner_optimize_timeout=30000; SELECT COUNT(*) FROM pa
 The Flink tiering job must have completed at least one epoch before Paimon snapshot metadata is available in MinIO. Wait ~2min after `make flink-submit` and check:
 ```bash
 docker compose exec minio mc ls local/fluss/paimon-warehouse/analytics.db/transactions/snapshot/ 2>/dev/null
+```
+
+---
+
+## Phase 4 — StarRocks Pattern 6 (Routine Load)
+
+### What it is
+
+StarRocks's built-in persistent Kafka consumer — no Flink required. Once started, the FE manages the job lifecycle and the BE nodes consume directly from Kafka partitions. Data lands in a native StarRocks Primary Key table and is immediately queryable.
+
+### How it works
+
+```
+Kafka topic: transactions
+      │
+      │  Routine Load (FE-managed job, BE consumes 12 partitions)
+      ▼
+┌──────────────────────────────────────────────────────────────┐
+│  StarRocks                                                   │
+│  FE → schedules load tasks per partition → BE consumes      │
+│  BE → parses JSON → commits to PK table every ~5s           │
+│                                                              │
+│  analytics.transactions_p6 (Primary Key table)              │
+│       freshness: ~5s theoretical / ~50s in Docker           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Init (run once)
+
+```bash
+make sr-p6-init
+# Creates analytics DB, transactions_p6 table, and Routine Load job
+```
+
+Init file: `docker/starrocks/init/02_p6_setup.sql`
+
+> **StarRocks 3.3.0 bugs to be aware of:**
+>
+> 1. **NPE on any function in `COLUMNS`**: Even `now()` crashes the Routine Load task planner. The fix used here is `DEFAULT CURRENT_TIMESTAMP` on the `ingest_time` table column — omit it from `COLUMNS` entirely.
+> 2. **`OFFSET_BEGINNING` syntax**: Requires explicit `kafka_partitions` list. Use `"property.auto.offset.reset" = "earliest"` instead.
+
+### Verify ingestion is running
+
+```bash
+make sr-p6-status
+# Shows: State, loadedRows, errorRows, Progress (per-partition offsets), loadRowsRate
+```
+
+Expected steady-state output:
+```
+State: RUNNING
+Statistic: {"loadedRows":500000,"errorRows":0,"loadRowsRate":4000,...}
+```
+
+### Benchmark queries
+
+```bash
+make sr-p6         # full Q1/Q2/Q3
+make sr-p6-freshness  # Q3 only (freshness probe)
+```
+
+### Verified results
+
+Measured on MacBook Pro (Apple M-series, 16 GB RAM, Docker Desktop 8 GB), generator at ~3–5K rows/sec, StarRocks 3.3.0:
+
+| Metric | Observed |
+|---|---|
+| Q1 — regional aggregate (last 1h) | 7 rows, **< 1s** |
+| Q2 — tumbling windows | 28 rows (4 active minutes), **< 1s** |
+| Q3 — `freshness_lag_ms` | **~50,000ms (~50s)** in Docker; theoretical min ~5s with `max_batch_interval=5` |
+| Q3 — `pipeline_lag_ms` | ~0ms |
+| Ingestion rate | ~3,000–5,000 rows/sec (sustained) |
+| Error rows | 0 |
+
+The 50s freshness is Docker resource overhead (FE scheduling latency on a constrained single node). In production, set `max_batch_interval=1` and `desired_concurrent_number` = partition count to get 1–3s freshness.
+
+### P6 vs P4 (same StarRocks engine, different freshness source)
+
+| | P4 — Paimon catalog | P6 — Routine Load |
+|---|---|---|
+| Data source | Fluss cold layer (Parquet snapshots) | Kafka topic (live stream) |
+| Freshness | ~2min (tiering epoch) | ~50s Docker / ~1–5s prod |
+| Table type | External (read-only) | Native PK (read-write, upsert) |
+| Flink required | Yes (for tiering job) | No |
+| Query speed | ~14s for Q2 on 2.1M rows | < 1s on 970K rows |
+
+### P6 commands
+
+```bash
+make sr-p6-init        # create table + Routine Load job (run once)
+make sr-p6-status      # show job state, lag, error rows
+make sr-p6             # run Q1/Q2/Q3 benchmark
+make sr-p6-freshness   # Q3 freshness probe
 ```
 
 ---
@@ -958,7 +1053,11 @@ make sr                                         # interactive MySQL client
 make sr-query Q="SELECT ..."                    # run any query inline
 make sr-init                                    # create Paimon external catalog (run once)
 make sr-p4                                      # run full P4 benchmark (Q1/Q2/Q3)
-make sr-freshness                               # Q3 freshness probe only
+make sr-freshness                               # Q3 freshness probe (P4)
+make sr-p6-init                                 # create transactions_p6 table + Routine Load (run once)
+make sr-p6-status                               # show Routine Load job state + lag
+make sr-p6                                      # run P6 benchmark (Q1/Q2/Q3 on native PK table)
+make sr-p6-freshness                            # Q3 freshness probe (P6)
 
 # ── Clock skew check (all phases) ──────────────────────────────────────────
 make check-clocks       # verify UTC alignment across containers (<5ms expected)
@@ -1025,5 +1124,5 @@ make up      # rebuilds and restarts everything
 | 1 — Kafka + Generator | ✅ Complete | — | Confluent KRaft broker, Python producer, Prometheus + Grafana |
 | 2 — ClickHouse | ✅ Complete | P1 | Kafka Engine → MergeTree, ~2.1s freshness verified, Q1/Q2/Q3 verified |
 | 3 — Flink + Fluss | ✅ Complete | P2, P3 | Flink ingestion + tiering jobs; Union Read (P2, -5s freshness = hot layer ahead of clock); cold lake Parquet scan (P3, ~2min freshness) |
-| 4 — StarRocks | ✅ Complete | P4 | Paimon external catalog on MinIO; Q2 in ~14s; P5 (Flink stream write) + P6 (Routine Load) pending |
+| 4 — StarRocks | ✅ Complete | P4, P6 | Paimon external catalog (P4, Q2 ~14s); Routine Load from Kafka (P6, ~50s freshness in Docker); P5 (Flink stream write) pending |
 | 5 — Full Benchmark | 🔜 Planned | All | Unified Grafana dashboard, side-by-side Q1/Q2/Q3 comparison |
