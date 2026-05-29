@@ -12,7 +12,7 @@ Full architectural decisions and pattern analysis: [PATTERNS.md](./PATTERNS.md).
 |---|---|---|---|
 | P1 | ClickHouse ← Kafka Engine | 1–10s | Batch (re-run) |
 | P2 | Flink SQL on Fluss (Union Read: hot + cold) | ~500ms–3s | Batch (re-run on live table) |
-| P3 | Flink SQL on Fluss cold lake only (`$lake`) | ~30min+ | Batch (Parquet columnar scan) |
+| P3 | Flink SQL on Fluss cold lake only (`$lake`) | ~2min | Batch (Parquet columnar scan) |
 | P4 | StarRocks ← Fluss Paimon catalog | 5–30 min | Batch (re-run) |
 | P5 | StarRocks ← Flink streaming write | 2–10s | Batch (re-run, live data) |
 | P6 | StarRocks ← Kafka Routine Load | 1–5s | Batch (re-run) |
@@ -66,7 +66,9 @@ Analytics/
     │   └── queries/
     │       └── benchmark.sql    ← Q1 / Q2 / Q3 in ClickHouse dialect
     ├── flink/
-    │   ├── Dockerfile           ← fluss-quickstart-flink:1.20 + Kafka connector JAR
+    │   ├── Dockerfile           ← fluss-quickstart-flink:1.20 + Paimon JARs + S3 plugin
+    │   ├── conf/
+    │   │   └── core-site.xml    ← Hadoop S3A config (required for P2 Union Read)
     │   └── sql/
     │       ├── 01_kafka_to_fluss.sql  ← streaming ingestion job (Kafka → Fluss)
     │       ├── benchmark_p2.sql       ← Q1/Q2/Q3 via Union Read (hot + cold)
@@ -500,37 +502,37 @@ Expected — minor clock skew between Docker containers (generator clock slightl
 | `coordinator-server` | `apache/fluss:0.9.1-incubating` | Fluss CoordinatorServer — metadata, tablet assignment |
 | `tablet-server` | `apache/fluss:0.9.1-incubating` | Fluss TabletServer — hot data (Arrow/RAM) + cold flush |
 | `flink-jobmanager` | (built locally) | Flink JobManager — UI at `:8082`, REST API at `:8082` |
-| `flink-taskmanager` | (built locally) | Flink TaskManager — 4 slots, executes the ingestion job |
-| `flink-sql-init` | (built locally) | One-shot: submits the Kafka→Fluss streaming job, exits 0 |
+| `flink-taskmanager` | (built locally) | Flink TaskManager — 4 slots, executes both ingestion and tiering jobs |
 
-The Flink image is built from `apache/fluss-quickstart-flink:1.20-0.9.1-incubating` (Fluss connector pre-bundled) plus the `flink-sql-connector-kafka-3.4.0-1.20.jar` downloaded during build.
+The Flink image is built from `apache/fluss-quickstart-flink:1.20-0.9.1-incubating` (Fluss connector pre-bundled) plus Paimon JARs and the Flink S3 Hadoop plugin. See `docker/flink/Dockerfile` and `docs/flink-fluss-lakehouse.md` for the full JAR inventory.
 
 ### How it works
 
 ```
 Kafka topic: transactions
       │
-      │  Flink streaming job (parallelism 2, consumer group: flink-fluss-consumer)
-      │  01_kafka_to_fluss.sql — submitted automatically by flink-sql-init
+      │  Flink streaming job (parallelism 1, consumer group: flink-fluss-consumer)
+      │  01_kafka_to_fluss.sql — submitted manually via `make flink-submit`
       ▼
  tablet-server  ←───────── coordinator-server ←── zookeeper
  (Arrow / RAM)                (metadata)           (coordination)
       │
-      │  Lakehouse Tiering Service — automatic flush every 30s
+      │  Lakehouse Tiering Service (separate Flink job — fluss-flink-tiering JAR)
+      │  Tiering epoch: every ~2min  (table.datalake.freshness = 2m)
       ▼
-   MinIO / S3 bucket: fluss/remote-data
-   (Parquet files — compacted, columnar, tiered every 30min)
+   MinIO: s3://fluss/paimon-warehouse/
+   (Parquet files — columnar, Paimon format)
       │
-      ├──────────────────────────┐
-      ▼                          ▼
- P2: Union Read              P3: Cold lake only
- (hot + cold, automatic)     ($lake suffix)
- freshness: ~500ms–3s        freshness: ~30s–2min
+      ├──────────────────────────────┐
+      ▼                              ▼
+ P2: Union Read                  P3: Cold lake only
+ (hot + cold, transparent)       ($lake suffix)
+ freshness: ~500ms–3s            freshness: ~2min (one tiering epoch)
 ```
 
-**Union Read** is transparent — querying `analytics.transactions` in the Fluss catalog automatically merges the hot Arrow layer with the cold Parquet layer. No special SQL syntax needed.
+**Union Read** is transparent — querying `analytics.transactions` in the Fluss catalog automatically merges the hot Arrow layer and the cold Parquet layer. No special SQL syntax needed. Implemented in Flink via `FlinkSourceEnumerator` + `LakeSplitGenerator`.
 
-**Cold-only read** uses the `$lake` table suffix (`transactions$lake`) to bypass the hot layer entirely, scanning only the compacted Parquet files in MinIO.
+**Cold-only read** uses the `$lake` table suffix (`transactions$lake`) to bypass the hot layer entirely, scanning only compacted Parquet files in MinIO.
 
 **Two timestamp columns** (same design as ClickHouse):
 
@@ -547,29 +549,32 @@ zookeeper ──(healthy)──► minio ──(healthy)──► minio-init ─
                                                                          tablet-server
                                                                                │
                 kafka-init ──(exit 0)──► flink-jobmanager ──(healthy)──► flink-taskmanager
-                                                │
-                                          flink-sql-init   (waits for TaskManager slot,
-                                               │            submits job, exits 0)
-                                          [Kafka→Fluss streaming job running in cluster]
 ```
+
+After all containers are up and healthy, submit the two Flink jobs manually:
+
+```bash
+make flink-submit
+```
+
+This submits: (1) the tiering job (`fluss-flink-tiering-0.9.1-incubating.jar`) with checkpointing enabled, and (2) the Kafka→Fluss streaming ingestion job via SQL client.
 
 ### Start Phase 3
 
-All Phase 3 services start automatically with `make up`. If Phase 1 & 2 are already running:
+```bash
+make up             # start all services (Phase 1–3)
+make flink-submit   # submit both Flink jobs (tiering + ingestion)
+```
 
+If Phase 1 & 2 are already running, start only Phase 3 services:
 ```bash
 docker compose up -d zookeeper minio minio-init
-docker compose up -d coordinator-server
-docker compose up -d tablet-server
-docker compose up -d flink-jobmanager flink-taskmanager flink-sql-init
+docker compose up -d coordinator-server tablet-server
+docker compose up -d flink-jobmanager flink-taskmanager
+make flink-submit
 ```
 
-Or do a full restart:
-```bash
-make down && make up
-```
-
-> **First build:** The Flink image downloads `flink-sql-connector-kafka-3.4.0-1.20.jar` (~15 MB) during `docker build`. First `make up` takes 3–5 extra minutes. Subsequent runs use the Docker build cache.
+> **First build:** The Flink image builds locally from `docker/flink/Dockerfile`. First `make up` takes 3–5 extra minutes. Subsequent runs use the Docker build cache.
 
 ### Verify
 
@@ -583,7 +588,6 @@ Expected Phase 3 additions:
 NAME                  STATUS
 coordinator-server    Up X minutes (healthy)
 flink-jobmanager      Up X minutes (healthy)
-flink-sql-init        Exited (0)
 flink-taskmanager     Up X minutes
 minio                 Up X minutes (healthy)
 minio-init            Exited (0)
@@ -591,19 +595,17 @@ tablet-server         Up X minutes
 zookeeper             Up X minutes (healthy)
 ```
 
-**Ingestion job is RUNNING:**
+**Both Flink jobs are RUNNING (after `make flink-submit`):**
 ```bash
 make flink-jobs
 ```
 
-Expected — one job in `RUNNING` state:
+Expected — two jobs in `RUNNING` state (tiering job + ingestion job):
 ```json
 {
     "jobs": [
-        {
-            "id": "abc123...",
-            "status": "RUNNING"
-        }
+        {"id": "abc123...", "status": "RUNNING"},
+        {"id": "def456...", "status": "RUNNING"}
     ]
 }
 ```
@@ -613,10 +615,11 @@ Or open the Flink UI:
 make flink     # → http://localhost:8082
 ```
 
-**Verify cold layer has data (allow ~60–120s for first compaction):**
+**Verify cold layer has data (allow ~2min for first tiering epoch):**
 ```bash
 make minio     # → http://localhost:9001  (minioadmin / minioadmin)
-# Navigate to: fluss/remote-data — should see Parquet files appear
+# Navigate to: fluss/paimon-warehouse/analytics.db/transactions/snapshot/
+# Should show LATEST + snapshot-1 once the first epoch commits
 ```
 
 ### Benchmark queries (Flink SQL dialect)
@@ -655,13 +658,16 @@ USE CATALOG fluss_catalog; USE analytics;
 SET 'execution.runtime-mode' = 'BATCH';
 
 SELECT
-    MAX(event_time)                                                    AS newest_event_time,
-    CURRENT_TIMESTAMP                                                  AS query_time,
-    TIMESTAMPDIFF(SECOND, MAX(event_time), CURRENT_TIMESTAMP) * 1000  AS freshness_lag_ms,
-    TIMESTAMPDIFF(SECOND, MAX(event_time), MAX(ingest_time)) * 1000   AS pipeline_lag_ms,
-    COUNT(*)                                                           AS total_rows
+    MAX(event_time)                                                                    AS newest_event_time,
+    CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3))                                            AS query_time,
+    TIMESTAMPDIFF(SECOND, MAX(event_time), CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3))) * 1000
+                                                                                       AS freshness_lag_ms,
+    TIMESTAMPDIFF(SECOND, MAX(event_time), MAX(ingest_time)) * 1000                   AS pipeline_lag_ms,
+    COUNT(*)                                                                           AS total_rows
 FROM transactions;
 ```
+
+> **Note:** `CURRENT_TIMESTAMP` returns `TIMESTAMP_LTZ` in Flink SQL, not `TIMESTAMP(3)`. Using it directly in `TIMESTAMPDIFF` with a `TIMESTAMP(3)` column throws `CodeGenException: TIMESTAMP_LTZ only supports diff between the same type`. The explicit `CAST` is required.
 
 **Q3 for P3 (cold lake only):**
 ```sql
@@ -686,33 +692,38 @@ make flink-sql          # interactive Flink SQL client
 make flink-p2           # run P2 benchmark queries (Union Read)
 make flink-p3           # run P3 benchmark queries (cold lake)
 make flink-cancel       # cancel all RUNNING jobs
-make flink-submit       # re-submit ingestion job (cancel first)
+make flink-submit       # re-submit tiering + ingestion jobs (cancel first)
 make minio              # open MinIO console (http://localhost:9001)
 ```
 
 ### Troubleshooting
 
-**`flink-sql-init` exited with non-zero status:**
+**Jobs not appearing after `make flink-submit`:**
+
+The job may be in INITIALIZING state. Wait 10–15s then check `make flink-jobs`. If still empty, verify the JobManager is healthy:
 ```bash
-docker compose logs flink-sql-init
+make status
+make flink-jobs
 ```
-Common causes:
-- JobManager not ready yet — run `make flink-submit` once `make flink-jobs` returns 200
-- Fluss coordinator not reachable — check `docker compose logs coordinator-server`
-- Kafka broker not healthy — check `make status`
 
-**No job appearing in Flink UI after `flink-sql-init` exits 0:**
+**`make flink-p2` fails with `UnsupportedSchemeException: Could not find a file io implementation for scheme 's3'`:**
 
-The job was submitted but may be in INITIALIZING state. Wait 10–15s then check `make flink-jobs`. If still empty, resubmit:
+The Flink containers are missing `HADOOP_CONF_DIR` or `core-site.xml`. P2 Union Read uses a different S3 code path than P3 — it goes through Paimon's `HadoopFileIO` fallback, which reads from `core-site.xml`. See `docs/flink-fluss-lakehouse.md` → "The Two S3 Code Paths" for the full explanation.
+
+Fix: ensure both `flink-jobmanager` and `flink-taskmanager` have `HADOOP_CONF_DIR=/opt/flink/conf` and the bind mount `./docker/flink/conf/core-site.xml:/opt/flink/conf/core-site.xml:ro`, then:
 ```bash
+docker compose up -d --force-recreate flink-jobmanager flink-taskmanager
 make flink-submit
 ```
 
 **`make flink-p2` or `make flink-p3` returns empty results:**
 
-Cold layer: allow ~60–120s after the ingestion job starts for the first Lakehouse Tiering flush to MinIO. Check MinIO console for Parquet files.
+Cold layer (P3): allow ~2min after the tiering job starts for the first tiering epoch to complete and commit a Paimon snapshot. Check:
+```bash
+docker compose exec minio mc ls local/fluss/paimon-warehouse/analytics.db/transactions/snapshot/ 2>/dev/null
+```
 
-Hot layer (Union Read): should have data within seconds of ingestion starting. If empty, confirm the ingestion job is RUNNING (`make flink-jobs`) and the generator is producing (`make gen-logs`).
+Hot layer (P2 Union Read): should have data within seconds of ingestion starting. If empty, confirm both jobs are RUNNING (`make flink-jobs`) and the generator is producing (`make gen-logs`).
 
 **Ingestion job FAILED after running briefly:**
 
@@ -731,6 +742,7 @@ make flink-submit
 ```bash
 make clean   # removes all volumes including fluss-data and minio-data
 make up      # rebuilds and restarts everything
+make flink-submit
 ```
 
 ---
@@ -836,7 +848,7 @@ make up      # rebuilds and restarts everything
 | Phase | Status | Patterns | Description |
 |---|---|---|---|
 | 1 — Kafka + Generator | ✅ Complete | — | Confluent KRaft broker, Python producer, Prometheus + Grafana |
-| 2 — ClickHouse | ✅ Complete | P1 | Kafka Engine → MergeTree, ~2s freshness, Q1/Q2/Q3 verified |
-| 3 — Flink + Fluss | ✅ Complete | P2, P3 | Flink ingestion job, Union Read (hot+cold), cold lake Parquet scan |
+| 2 — ClickHouse | ✅ Complete | P1 | Kafka Engine → MergeTree, ~2.1s freshness verified, Q1/Q2/Q3 verified |
+| 3 — Flink + Fluss | ✅ Complete | P2, P3 | Flink ingestion + tiering jobs; Union Read (P2, -5s freshness = hot layer ahead of clock); cold lake Parquet scan (P3, ~2min freshness) |
 | 4 — StarRocks | 🔜 Next | P4, P5, P6 | Paimon catalog, Flink stream write, Routine Load |
 | 5 — Full Benchmark | 🔜 Planned | All | Unified Grafana dashboard, side-by-side Q1/Q2/Q3 comparison |

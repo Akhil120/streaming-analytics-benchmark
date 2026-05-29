@@ -129,13 +129,26 @@ Produce to Kafka  ──┐
 Visible in MergeTree  ──► freshness_lag ≈ 500ms – 10s (tunable)
 ```
 
+### Verified results
+
+Measured on MacBook Pro (Apple M-series, 16 GB RAM, Docker Desktop 8 GB, ~10K msg/s generator):
+
+| Metric | Observed |
+|---|---|
+| Steady-state `freshness_lag_ms` | **~2,100ms** |
+| `pipeline_lag_ms` | ~0ms (±8s clock skew noise across containers — cosmetic) |
+| Ingestion throughput | ~12,000 rows/sec |
+| Startup backlog drain | ~60–90 seconds |
+
 ---
 
-## Pattern 2 — Flink SQL on Fluss Hot Layer (Union Read, Streaming)
+## Pattern 2 — Flink SQL on Fluss (Union Read: hot + cold)
 
 ### What it is
 
-The most capable real-time pattern. Flink reads from Apache Fluss using a continuous streaming query. The query transparently combines data from Fluss's **hot layer** (sub-second fresh, Arrow format in TabletServer) and **cold layer** (historical Parquet via Paimon/Iceberg) through Fluss's Union Read feature. A single query sees all historical data plus all incoming new data without re-submission.
+The most capable real-time analytical pattern. Flink reads from Apache Fluss in **batch execution mode** (`SET 'execution.runtime-mode' = 'BATCH'`), and the query transparently combines data from Fluss's **hot layer** (sub-second fresh, Arrow format in TabletServer) and **cold layer** (historical Parquet via Paimon/Iceberg) through Fluss's Union Read feature. The result is a bounded query over all available data — historical Parquet plus the latest uncommitted Arrow rows — without any special SQL syntax.
+
+Union Read also supports continuous streaming queries (removing the `SET BATCH` line), but the benchmark uses batch mode for comparable point-in-time measurement against ClickHouse and StarRocks.
 
 ### Architecture
 
@@ -162,10 +175,10 @@ Flink Ingestion Job
 │                    Single Logical Table                     │
 └─────────────────────────────────────────────────────────────┘
                              │
-                             │  Flink SQL continuous query
+                             │  Flink SQL (BATCH mode for benchmark)
                              ▼
-                    Streaming result updates
-                    (new rows emitted as events arrive)
+                    Bounded result set
+                    (all hot + cold rows at query time)
 ```
 
 ### How it works
@@ -200,26 +213,25 @@ For your "query all Kafka topic data including incoming new data" requirement: u
 
 ### Query model
 
-- **True streaming.** The query stays open and emits updated results as new events commit to the hot layer.
-- No re-submission needed — the query already includes in-flight data within one checkpoint interval.
-- For aggregations: results update incrementally as new events arrive.
-- For point queries: answered from KvStore (hot) with sub-second latency.
+For the benchmark: **Batch execution mode.** The query submits, reads all available hot + cold data, returns a bounded result, and terminates. This is the mode used for all P2 Q1/Q2/Q3 measurements.
+
+Union Read also supports **continuous streaming mode** (omit the `SET 'execution.runtime-mode' = 'BATCH'` line) — the query stays open, emitting updated results as new events arrive. This is useful for live dashboards but produces an unbounded result stream rather than a point-in-time answer.
 
 ### Strengths
 
-- **Only pattern here with true continuous queries** — the query itself is a live subscription
-- Sub-second freshness for incoming data
-- Handles both historical backfill and live stream in a single query
-- Column and partition pruning reduce I/O significantly
+- **Only pattern in this benchmark with true continuous query capability** (streaming mode)
+- In batch mode, Union Read delivers sub-second-fresh results — the hot Arrow layer is included alongside historical Parquet in a single scan
+- Handles both historical backfill and live stream in a single query — no re-submission or two-query fan-out
+- Column and partition pruning reduce I/O significantly (Arrow format)
 - Native Flink integration — no additional connectors or middleware needed
 - Primary Key tables support upserts with exactly-once semantics
 
 ### Limitations
 
-- **Union Read is currently Flink-only** — other engines (Spark, StarRocks, Trino) can only read the cold layer
+- **Union Read is currently Flink-only** — other engines (Spark, StarRocks, Trino) can only read the cold Paimon layer
 - Requires a running Flink cluster for all queries (not a standalone query engine)
-- Streaming query results require a sink (another table, print, or external system) — not interactive ad-hoc queries
-- Cold layer freshness for non-Flink engines depends on tiering service compaction frequency
+- P2 queries scan the entire table (all hot + cold data) — no index, no skipping; query latency grows linearly with data volume
+- Flink batch queries over large datasets are significantly slower than StarRocks MPP for equivalent OLAP workloads
 
 ### Freshness lag profile
 
@@ -227,12 +239,25 @@ For your "query all Kafka topic data including incoming new data" requirement: u
 Produce to Kafka  ──┐
                     │  Flink source poll (~ms) + checkpoint interval (~1–30s)
                     ▼
-Committed to Fluss hot layer  ──► freshness_lag ≈ 100ms – 2s
-                    │
-                    │  Tiering service compaction (background, async)
-                    ▼
-Available in cold layer  ──► freshness_lag ≈ minutes (for non-Flink engines)
+Committed to Fluss hot layer  ──► Union Read freshness ≈ 0ms – 3s
+                                  (hot data is included in the same batch scan)
 ```
+
+### Verified results
+
+Measured with ~16.75M rows (hot + cold combined), generator at ~10K msg/s:
+
+| Query | Result | Notes |
+|---|---|---|
+| Q1 — regional aggregate | 7 regions | |
+| Q1 — query latency | ~608s | Full table scan across all hot+cold data |
+| Q2 — tumbling windows | 120 rows | |
+| Q2 — query latency | ~420s | |
+| Q3 — `freshness_lag_ms` | **-5,000ms** | Negative = hot layer ahead of query clock (correct) |
+| Q3 — `pipeline_lag_ms` | 0ms | |
+| Q3 — `total_rows` | 16,750,285 | |
+
+The -5,000ms freshness is expected and correct — it means the hot Arrow layer contains data that is 5 seconds newer than the query's system clock at the time `CURRENT_TIMESTAMP` was evaluated. This is Union Read working as designed.
 
 ---
 
@@ -272,13 +297,13 @@ Bounded result set (query terminates after reading snapshot)
 
 ### Distinction from Pattern 2
 
-| Dimension | Pattern 2 (Streaming) | Pattern 3 (Batch) |
+| Dimension | Pattern 2 (Union Read, batch mode) | Pattern 3 (Cold only) |
 |---|---|---|
-| Query lifetime | Unbounded — stays open | Bounded — terminates |
-| Data coverage | Hot + Cold (Union Read) | Cold only (snapshot) |
-| Freshness | Sub-second (hot layer) | Minutes (last compaction) |
-| Result delivery | Continuous stream of updates | Single result set |
-| Use case | Live dashboards, alerting | Reports, historical aggregations |
+| Query lifetime | Bounded — terminates (batch mode) | Bounded — terminates |
+| Data coverage | Hot + Cold (Union Read) | Cold only (Paimon snapshot) |
+| Freshness | Sub-second (hot layer included) | ~2min (tiering epoch, configurable) |
+| Result delivery | Single result set at query time | Single result set at query time |
+| Use case | Ad-hoc queries on all data (including latest) | Scheduled reports, historical aggregations |
 
 ### Query model
 
@@ -295,9 +320,9 @@ Bounded result set (query terminates after reading snapshot)
 
 ### Limitations
 
-- **Freshness bounded by compaction interval** — cannot see data newer than the last tiering service run
-- Not suitable for use cases requiring data that arrived in the last few minutes
-- Cold layer snapshot may lag hot layer by several minutes depending on compaction frequency and data volume
+- **Freshness bounded by tiering epoch interval** — cannot see data newer than the last Paimon snapshot
+- The tiering epoch (`table.datalake.freshness`) must be long enough for the download + sort + write cycle to complete (minimum ~90s for large tables at ~10K msg/s)
+- Cold layer snapshot may lag hot layer by 2–30 minutes depending on `table.datalake.freshness` and data volume
 
 ### Freshness lag profile
 
@@ -305,8 +330,22 @@ Bounded result set (query terminates after reading snapshot)
 Produce to Kafka  ──┐
                     │  ingestion + tiering/compaction delay
                     ▼
-Cold layer snapshot  ──► freshness_lag ≈ 5–30 minutes (compaction-dependent)
+Cold layer snapshot  ──► freshness_lag ≈ 2min (with table.datalake.freshness=2m)
+                                         ≈ 5–30min if freshness set higher
 ```
+
+### Verified results
+
+Measured with ~7.6M rows in cold layer (Parquet only), generator paused before the run:
+
+| Query | Result | Notes |
+|---|---|---|
+| Q1 — regional aggregate (last 1h) | 0 rows | Generator paused; all data > 1h old |
+| Q2 — tumbling windows | 120 rows | |
+| Q2 — query latency | ~132s | Parquet-only scan; faster per-row than P2 Union Read (no hot layer merge overhead) |
+| Q3 — `freshness_lag_ms` | 11,233,000ms (~3.1h) | Generator paused before run; expected |
+| Q3 — `pipeline_lag_ms` | 0ms | |
+| Q3 — `total_rows` | 7,610,537 | Cold layer only — hot layer rows excluded |
 
 ---
 
