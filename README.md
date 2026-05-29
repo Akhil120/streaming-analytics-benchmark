@@ -3,6 +3,7 @@
 End-to-end benchmark comparing six ingestion and query patterns across ClickHouse, Apache Fluss, Apache Flink, and StarRocks — all fed from a common Kafka backbone.
 
 Full architectural decisions and pattern analysis: [PATTERNS.md](./PATTERNS.md).
+Final benchmark results and comparison: [BENCHMARK.md](./BENCHMARK.md).
 
 ---
 
