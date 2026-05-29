@@ -7,6 +7,46 @@ Final benchmark results and comparison: [BENCHMARK.md](./BENCHMARK.md).
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart TD
+    GEN["Data Generator\n~2–5K rows/sec"] --> KAFKA["Apache Kafka\n3-broker KRaft"]
+
+    KAFKA -->|"Kafka Engine\n+ Materialized View"| CH["ClickHouse\nMergeTree"]
+    KAFKA -->|"Flink Kafka\nSource"| FJ["Flink Ingestion Job"]
+    KAFKA -->|"P5: Flink\nStream Load"| SR_P5["StarRocks\ntransactions_p5\n(PK table)"]
+    KAFKA -->|"P6: Routine\nLoad"| SR_P6["StarRocks\ntransactions_p6\n(PK table)"]
+
+    FJ --> HOT["Fluss Hot Layer\nArrow / TabletServer\nsub-second fresh"]
+    FJ --> COLD["Fluss Cold Layer\nPaimon Parquet / MinIO\n~2–5min fresh"]
+
+    HOT -->|"P2: Union Read\nFlink SQL"| P2["P2 queries\n~0ms freshness\n420s Q2"]
+    COLD -->|"P3: batch scan\nFlink SQL"| P3["P3 queries\n~2min freshness\n132s Q2"]
+    COLD -->|"P4: external\nPaimon catalog"| P4["P4 queries\n~2min freshness\n14s Q2"]
+
+    CH --> P1["P1 queries\n~2s freshness\n< 1s Q2"]
+    SR_P5 --> P5["P5 queries\n~10–15s freshness\n< 1s Q2"]
+    SR_P6 --> P6["P6 queries\n~1–5s freshness\n< 1s Q2"]
+
+    style GEN fill:#f5f5f5,stroke:#999
+    style KAFKA fill:#ff6b35,color:#fff,stroke:#cc5528
+    style CH fill:#ffcc00,stroke:#cc9900
+    style HOT fill:#4a90d9,color:#fff,stroke:#2d6fa8
+    style COLD fill:#7bb3e0,color:#fff,stroke:#2d6fa8
+    style FJ fill:#4a90d9,color:#fff,stroke:#2d6fa8
+    style SR_P5 fill:#e05c4b,color:#fff,stroke:#b33d2e
+    style SR_P6 fill:#e05c4b,color:#fff,stroke:#b33d2e
+    style P4 fill:#e05c4b,color:#fff,stroke:#b33d2e
+    style P1 fill:#fff8dc,stroke:#bba
+    style P2 fill:#fff8dc,stroke:#bba
+    style P3 fill:#fff8dc,stroke:#bba
+    style P5 fill:#fff8dc,stroke:#bba
+    style P6 fill:#fff8dc,stroke:#bba
+```
+
+---
+
 ## What This Benchmarks
 
 | Pattern | Stack | Freshness | Query model |
