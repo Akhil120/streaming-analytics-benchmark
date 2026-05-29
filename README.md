@@ -917,6 +917,88 @@ docker compose exec minio mc ls local/fluss/paimon-warehouse/analytics.db/transa
 
 ---
 
+## Phase 4 — StarRocks Pattern 5 (Flink Stream Write)
+
+### What it is
+
+A Flink streaming job reads from Kafka and writes to a native StarRocks Primary Key table via Stream Load. Unlike P4 (which reads a cold snapshot) this path is continuously flowing — every event is visible in StarRocks within seconds of landing in Kafka.
+
+### How it works
+
+```
+Kafka topic: transactions
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Flink 1.20                                                 │
+│                                                             │
+│  kafka_transactions_p5  ──→  INSERT INTO  ──→  starrocks_p5_sink  │
+│  (Kafka connector)              (SELECT/cast)    (StarRocks V1)    │
+└─────────────────────────────────────────────────────────────┘
+        │
+        ▼  HTTP Stream Load (port 8040, V1 direct-BE)
+┌─────────────────────────────────────────────────────────────┐
+│  StarRocks 3.3                                              │
+│  analytics.transactions_p5  (Primary Key table)             │
+│  — queryable immediately after each micro-batch flush       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Start P5
+
+```bash
+# 1. Create the StarRocks target table (run once)
+make sr-p5-init
+
+# 2. Submit the Flink streaming job (Kafka → StarRocks)
+make flink-submit-p5
+
+# 3. Run Q1/Q2/Q3 benchmark
+make sr-p5
+
+# 4. Probe freshness continuously
+make sr-p5-freshness
+```
+
+> **Operational note — PAUSE P6 before benchmarking P5:**
+> P6 Routine Load and P5 Stream Load both write to the StarRocks BE concurrently. P6's large batch transactions (186K rows) hold BE tablet resources during the `PublishVersion` RPC for 77–83 seconds, starving P5 commits and producing `THRIFT_EAGAIN` errors.
+> Run before benchmarking P5:
+> ```sql
+> PAUSE ROUTINE LOAD FOR analytics.transactions_p6_load;
+> ```
+> Resume after:
+> ```sql
+> RESUME ROUTINE LOAD FOR analytics.transactions_p6_load;
+> ```
+
+### Verified results
+
+Measured on MacBook Pro (Apple M-series, 16 GB RAM, Docker Desktop 8 GB), generator at ~3–5K rows/sec, StarRocks 3.3.0, ~1M rows in `transactions_p5`:
+
+| Metric | Value |
+|--------|-------|
+| freshness_lag_ms | ~55 000 ms (job startup catch-up); steady-state **10–15s** |
+| Q1 query latency | < 1s |
+| Q2 query latency | < 1s |
+| pipeline_lag_ms | ~0ms (CURRENT_TIMESTAMP in Flink ≈ event time for live data) |
+| Row count | ~1M rows at benchmark time |
+
+### Implementation notes
+
+Five bugs encountered and fixed during implementation:
+
+1. **ISO-8601 `Z` suffix not stripped** — Flink's `json.timestamp-format.standard=ISO-8601` doesn't strip the trailing `Z` from values like `"2026-05-29T00:17:49.301Z"`, causing `Fail to deserialize at field: event_time`. Fix: declare `event_time STRING` in the Kafka source table and cast in the INSERT: `TO_TIMESTAMP(REPLACE(event_time, 'Z', ''), 'yyyy-MM-dd''T''HH:mm:ss.SSS')`.
+
+2. **V2 Stream Load redirect to 127.0.0.1** — With `sink.version=V2`, the FE returns a redirect to `127.0.0.1:8040` (the BE's self-advertised address), which is unreachable from Flink's Docker network. Fix: use `sink.version=V1` and point `load-url` directly at the BE hostname (`starrocks:8040`).
+
+3. **V1 JSON TIMESTAMP serialization** — With `format=json`, TIMESTAMP columns are serialized in a format StarRocks DATETIME can't parse, producing `NumberLoadedRows: 0`. Fix: use `format=csv` with a non-printable column separator (`\x01`).
+
+4. **`sink.buffer-flush.max-rows` minimum** — Setting `max-rows=10000` throws `ValidationException: must be in [64000, 5000000]`. Fix: use `64000`.
+
+5. **THRIFT_EAGAIN (FE RPC timeout)** — Root cause: concurrent P6 Routine Load holding BE resources. Fix: PAUSE P6 before running P5 benchmark (see operational note above).
+
+---
+
 ## Phase 4 — StarRocks Pattern 6 (Routine Load)
 
 ### What it is
@@ -1054,6 +1136,10 @@ make sr-query Q="SELECT ..."                    # run any query inline
 make sr-init                                    # create Paimon external catalog (run once)
 make sr-p4                                      # run full P4 benchmark (Q1/Q2/Q3)
 make sr-freshness                               # Q3 freshness probe (P4)
+make sr-p5-init                                 # create transactions_p5 table (run once)
+make flink-submit-p5                            # submit Kafka→StarRocks streaming job
+make sr-p5                                      # run P5 benchmark (Q1/Q2/Q3 on native PK table)
+make sr-p5-freshness                            # Q3 freshness probe (P5)
 make sr-p6-init                                 # create transactions_p6 table + Routine Load (run once)
 make sr-p6-status                               # show Routine Load job state + lag
 make sr-p6                                      # run P6 benchmark (Q1/Q2/Q3 on native PK table)
@@ -1124,5 +1210,5 @@ make up      # rebuilds and restarts everything
 | 1 — Kafka + Generator | ✅ Complete | — | Confluent KRaft broker, Python producer, Prometheus + Grafana |
 | 2 — ClickHouse | ✅ Complete | P1 | Kafka Engine → MergeTree, ~2.1s freshness verified, Q1/Q2/Q3 verified |
 | 3 — Flink + Fluss | ✅ Complete | P2, P3 | Flink ingestion + tiering jobs; Union Read (P2, -5s freshness = hot layer ahead of clock); cold lake Parquet scan (P3, ~2min freshness) |
-| 4 — StarRocks | ✅ Complete | P4, P6 | Paimon external catalog (P4, Q2 ~14s); Routine Load from Kafka (P6, ~50s freshness in Docker); P5 (Flink stream write) pending |
+| 4 — StarRocks | ✅ Complete | P4, P5, P6 | Paimon external catalog (P4, Q2 ~14s); Flink streaming write (P5, ~55s startup, ~10–15s steady-state); Routine Load from Kafka (P6, ~50s freshness in Docker) |
 | 5 — Full Benchmark | 🔜 Planned | All | Unified Grafana dashboard, side-by-side Q1/Q2/Q3 comparison |
