@@ -9,6 +9,7 @@ SQL_GATEWAY := http://localhost:8083
         flink flink-jobs flink-logs flink-sql flink-submit flink-cancel \
         flink-p2 flink-p3 \
         minio \
+        sr sr-query sr-init sr-p4 sr-freshness \
         ui grafana prometheus smoke-test
 
 # Start all Phase 1 services
@@ -149,6 +150,36 @@ flink-submit: flink-submit-tiering flink-submit-sql
 # Open MinIO console (cold storage for Fluss datalake tier)
 minio:
 	open http://localhost:9001
+
+# ── StarRocks (Phase 4) ───────────────────────────────────────────────────────
+
+# Open interactive StarRocks MySQL client
+sr:
+	docker compose exec starrocks mysql -h 127.0.0.1 -P 9030 -u root
+
+# Run a SQL query inline: make sr-query Q="SELECT count(*) FROM paimon_catalog.analytics.transactions"
+sr-query:
+	docker compose exec starrocks mysql -h 127.0.0.1 -P 9030 -u root -e "$(Q)"
+
+# Create the Paimon external catalog (run once after make up)
+sr-init:
+	docker compose exec -T starrocks mysql -h 127.0.0.1 -P 9030 -u root \
+	    < docker/starrocks/init/01_catalog.sql
+	@echo "StarRocks Paimon catalog created."
+
+# Run P4 benchmark queries (StarRocks → Paimon cold lake)
+sr-p4:
+	docker compose exec -T starrocks mysql -h 127.0.0.1 -P 9030 -u root \
+	    < docker/starrocks/queries/benchmark_p4.sql
+
+# Q3 freshness probe only
+sr-freshness:
+	docker compose exec starrocks mysql -h 127.0.0.1 -P 9030 -u root -e \
+	    "SELECT MAX(event_time) AS newest_event_time, NOW() AS query_time, \
+	     TIMESTAMPDIFF(SECOND, MAX(event_time), NOW()) * 1000 AS freshness_lag_ms, \
+	     TIMESTAMPDIFF(SECOND, MAX(event_time), MAX(ingest_time)) * 1000 AS pipeline_lag_ms, \
+	     COUNT(*) AS total_rows \
+	     FROM paimon_catalog.analytics.transactions"
 
 # ── Clock skew verification ───────────────────────────────────────────────────
 # All containers must agree on UTC wall-clock to within ~5ms for accurate

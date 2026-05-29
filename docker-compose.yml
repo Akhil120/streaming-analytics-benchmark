@@ -9,6 +9,7 @@ volumes:
   zookeeper-data:
   minio-data:
   fluss-data:
+  starrocks-data:
 
 services:
 
@@ -482,6 +483,37 @@ services:
       timeout: 5s
       retries: 15
       start_period: 60s
+    restart: unless-stopped
+
+  # ── Phase 4: StarRocks (allin1 — FE + BE in one container) ─────────────────
+
+  starrocks:
+    image: starrocks/allin1-ubi:latest
+    container_name: starrocks
+    hostname: starrocks
+    networks: [analytics]
+    ports:
+      - "9030:9030"   # MySQL protocol (client connections, make sr)
+      - "8030:8030"   # FE HTTP API  (Stream Load endpoint for P5)
+      - "8040:8040"   # BE HTTP API  (Stream Load BE endpoint for P5)
+    environment:
+      TZ: UTC
+    volumes:
+      - starrocks-data:/opt/starrocks
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9030/ 2>/dev/null; mysql -h 127.0.0.1 -P 9030 -u root --connect-timeout=3 -e 'SELECT 1' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
     restart: unless-stopped
 
   # ── Phase 3: Flink — TaskManager ─────────────────────────────────────────────

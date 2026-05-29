@@ -73,6 +73,11 @@ Analytics/
     │       ├── 01_kafka_to_fluss.sql  ← streaming ingestion job (Kafka → Fluss)
     │       ├── benchmark_p2.sql       ← Q1/Q2/Q3 via Union Read (hot + cold)
     │       └── benchmark_p3.sql       ← Q1/Q2/Q3 via cold lake only ($lake suffix)
+    ├── starrocks/
+    │   ├── init/
+    │   │   └── 01_catalog.sql    ← CREATE EXTERNAL CATALOG paimon_catalog (run once via sr-init)
+    │   └── queries/
+    │       └── benchmark_p4.sql  ← Q1/Q2/Q3 in StarRocks dialect
     ├── prometheus/
     │   └── prometheus.yml
     └── grafana/
@@ -100,6 +105,9 @@ Analytics/
 | Fluss Coordinator | `localhost:9123` | — (internal) | 3 |
 | Kafka (host tools) | `localhost:9092` | — | 1 |
 | Kafka (Docker-internal) | `broker:29092` | — | 1 |
+| StarRocks MySQL | `localhost:9030` | root / (no password) | 4 |
+| StarRocks FE HTTP | http://localhost:8030 | — | 4 |
+| StarRocks BE HTTP | http://localhost:8040 | — | 4 |
 
 ---
 
@@ -747,6 +755,166 @@ make flink-submit
 
 ---
 
+## Phase 4 — StarRocks (Pattern 4)
+
+### Containers
+
+| Container | Image | Purpose |
+|---|---|---|
+| `starrocks` | `starrocks/allin1-ubi:latest` | StarRocks all-in-one (FE + BE) — OLAP query engine + Paimon catalog |
+
+StarRocks reads the same cold-layer Parquet files that Flink P3 reads (in MinIO at `s3://fluss/paimon-warehouse`), via an external Paimon catalog. No Flink cluster is needed for queries — StarRocks handles everything once the catalog is configured.
+
+### How it works
+
+```
+MinIO: s3://fluss/paimon-warehouse/   ← Parquet files, written by Flink tiering job
+      │
+      │  External Catalog (CREATE EXTERNAL CATALOG paimon_catalog)
+      ▼
+┌─────────────────────────────────────────────────────────────┐
+│  StarRocks 3.3                                              │
+│  FE — query planning, catalog metadata (reads Paimon manifests from MinIO)  │
+│  BE — vectorized MPP scan of Parquet files in MinIO         │
+│                                                             │
+│  SELECT * FROM paimon_catalog.analytics.transactions        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Start Phase 4
+
+StarRocks starts automatically with `make up` (depends on `minio-init`). To add it to an already-running stack:
+```bash
+docker compose up -d starrocks
+```
+
+Wait ~90s for FE + BE to fully initialize (image is ~1.5 GB, first start is slow).
+
+### Init the Paimon catalog (run once)
+
+```bash
+make sr-init
+# Creates paimon_catalog in StarRocks pointing at s3://fluss/paimon-warehouse
+```
+
+This runs `docker/starrocks/init/01_catalog.sql`:
+
+```sql
+CREATE EXTERNAL CATALOG IF NOT EXISTS paimon_catalog
+COMMENT "Fluss cold lake — Paimon Parquet on MinIO"
+PROPERTIES (
+  "type"                              = "paimon",
+  "paimon.catalog.type"               = "filesystem",
+  "paimon.catalog.warehouse"          = "s3://fluss/paimon-warehouse",
+  "aws.s3.use_aws_sdk_default_behavior" = "false",
+  "aws.s3.enable_path_style_access"   = "true",
+  "aws.s3.access_key"                 = "minioadmin",
+  "aws.s3.secret_key"                 = "minioadmin",
+  "aws.s3.endpoint"                   = "http://minio:9000",
+  "aws.s3.region"                     = "us-east-1"
+);
+```
+
+> **Note:** StarRocks uses the `aws.s3.*` namespace (not `s3.*`). The `enable_path_style_access = true` property is required for MinIO (path-style S3 URLs).
+
+### Verify
+
+```bash
+make sr-query Q="SHOW CATALOGS"
+# paimon_catalog should appear (type: Paimon)
+
+make sr-query Q="SHOW TABLES FROM paimon_catalog.analytics"
+# transactions
+
+make sr-query Q="SELECT COUNT(*) FROM paimon_catalog.analytics.transactions"
+# Should return ~2M+ rows (grows with each tiering epoch)
+```
+
+> **First query cold start:** The FE JVM warms up on the first query and fetches Paimon metadata from MinIO for the first time. This can trigger `ERROR 1064: StarRocks planner use long time 3000 ms`. Fix: run `SET new_planner_optimize_timeout=30000;` in the same session, or just retry — subsequent queries are fast once the JVM is warm.
+
+### Benchmark queries (StarRocks dialect)
+
+Full file: `docker/starrocks/queries/benchmark_p4.sql`
+
+Key dialect differences from standard SQL:
+
+| Concept | Standard SQL | StarRocks |
+|---|---|---|
+| Current timestamp | `NOW()` | `NOW()` |
+| Date diff in ms | `DATEDIFF('millisecond', a, b)` | `TIMESTAMPDIFF(SECOND, a, b) * 1000` |
+| Tumbling window | `TUMBLE(ts, INTERVAL '1' MINUTE)` | `DATE_TRUNC('MINUTE', ts)` |
+| Row count | `COUNT(*)` | `COUNT(*)` |
+
+**Run P4 benchmark:**
+```bash
+make sr-p4
+```
+
+**Q3 freshness probe:**
+```bash
+make sr-freshness
+```
+
+**Q3 SQL (StarRocks dialect):**
+```sql
+SELECT MAX(event_time)                                           AS newest_event_time,
+       NOW()                                                     AS query_time,
+       TIMESTAMPDIFF(SECOND, MAX(event_time), NOW()) * 1000     AS freshness_lag_ms,
+       TIMESTAMPDIFF(SECOND, MAX(event_time), MAX(ingest_time)) * 1000 AS pipeline_lag_ms,
+       COUNT(*)                                                  AS total_rows
+FROM paimon_catalog.analytics.transactions;
+```
+
+### Verified results
+
+Measured on MacBook Pro (Apple M-series, 16 GB RAM, Docker Desktop 8 GB). ~2.1M rows in cold lake, generator paused before queries, StarRocks 3.3.0:
+
+| Metric | Observed |
+|---|---|
+| Q1 — regional aggregate (last 1h) | 0 rows, ~17.5s (data > 1h old — expected) |
+| Q2 — tumbling windows | 70 rows (10 min × 7 regions), **~14s** |
+| Q3 — `freshness_lag_ms` | ~10,844,000ms (3h — generator stopped) |
+| Q3 — `pipeline_lag_ms` | ~3,817,000ms (backfill artifact; ~0ms steady-state) |
+| Q3 — `total_rows` | 2,145,583 |
+| **vs Flink P3 Q2** | **~10× faster** (StarRocks 14s vs Flink 132s, similar row count) |
+
+### StarRocks commands
+
+```bash
+make sr                                    # interactive MySQL client
+make sr-query Q="SELECT ..."               # run any query inline
+make sr-init                               # create Paimon external catalog (run once)
+make sr-p4                                 # run full P4 benchmark (Q1/Q2/Q3)
+make sr-freshness                          # Q3 freshness probe only
+```
+
+### Troubleshooting
+
+**`make sr-init` fails with `Can't connect to MySQL server`:**
+
+StarRocks is still starting. The BE takes ~90s to register with the FE after container start. Check:
+```bash
+docker compose logs starrocks | tail -20
+make sr-query Q="SHOW BACKENDS\G"
+# Alive: true means BE is registered and ready
+```
+
+**First query times out with `planner use long time 3000 ms`:**
+
+JVM cold start + first Paimon metadata fetch from MinIO. Retry or run:
+```bash
+make sr-query Q="SET new_planner_optimize_timeout=30000; SELECT COUNT(*) FROM paimon_catalog.analytics.transactions"
+```
+
+**`paimon_catalog` returns no tables:**
+
+The Flink tiering job must have completed at least one epoch before Paimon snapshot metadata is available in MinIO. Wait ~2min after `make flink-submit` and check:
+```bash
+docker compose exec minio mc ls local/fluss/paimon-warehouse/analytics.db/transactions/snapshot/ 2>/dev/null
+```
+
+---
+
 ## Operational Commands
 
 ```bash
@@ -784,6 +952,13 @@ make flink-p3           # run P3 benchmark queries (cold lake only)
 make flink-cancel       # cancel all RUNNING Flink jobs
 make flink-submit       # re-submit Kafka→Fluss ingestion job
 make minio              # open MinIO console → http://localhost:9001
+
+# ── StarRocks (Phase 4) ────────────────────────────────────────────────────
+make sr                                         # interactive MySQL client
+make sr-query Q="SELECT ..."                    # run any query inline
+make sr-init                                    # create Paimon external catalog (run once)
+make sr-p4                                      # run full P4 benchmark (Q1/Q2/Q3)
+make sr-freshness                               # Q3 freshness probe only
 
 # ── Clock skew check (all phases) ──────────────────────────────────────────
 make check-clocks       # verify UTC alignment across containers (<5ms expected)
@@ -850,5 +1025,5 @@ make up      # rebuilds and restarts everything
 | 1 — Kafka + Generator | ✅ Complete | — | Confluent KRaft broker, Python producer, Prometheus + Grafana |
 | 2 — ClickHouse | ✅ Complete | P1 | Kafka Engine → MergeTree, ~2.1s freshness verified, Q1/Q2/Q3 verified |
 | 3 — Flink + Fluss | ✅ Complete | P2, P3 | Flink ingestion + tiering jobs; Union Read (P2, -5s freshness = hot layer ahead of clock); cold lake Parquet scan (P3, ~2min freshness) |
-| 4 — StarRocks | 🔜 Next | P4, P5, P6 | Paimon catalog, Flink stream write, Routine Load |
+| 4 — StarRocks | ✅ Complete | P4 | Paimon external catalog on MinIO; Q2 in ~14s; P5 (Flink stream write) + P6 (Routine Load) pending |
 | 5 — Full Benchmark | 🔜 Planned | All | Unified Grafana dashboard, side-by-side Q1/Q2/Q3 comparison |

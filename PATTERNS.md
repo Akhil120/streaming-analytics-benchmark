@@ -440,6 +440,26 @@ Query result  ──► freshness_lag ≈ 5–30 minutes (same ceiling as Patter
               ──► query_latency ≈ milliseconds to seconds (StarRocks MPP, typically faster than Flink batch for OLAP)
 ```
 
+### Verified results
+
+Measured on a MacBook Pro (Apple M-series, 16 GB RAM, Docker Desktop 8 GB). Data produced for ~26 minutes, generator paused before queries. StarRocks 3.3.0 (allin1-ubi), Paimon cold lake in MinIO (`s3://fluss/paimon-warehouse`).
+
+| Query | Result | Wall clock | Notes |
+|---|---|---|---|
+| Q1 — regional aggregate (last 1h) | **0 rows** | ~17.5s | Generator paused; all data > 1h old at query time |
+| Q2 — tumbling windows | **70 rows** | **~14s** | 10 min × 7 regions — entire dataset in windows |
+| Q3 — `freshness_lag_ms` | **10,844,000ms (~3h)** | — | Expected: generator paused 3h before query |
+| Q3 — `pipeline_lag_ms` | **3,817,000ms (~63min)** | — | Backfill artifact: `ingest_time` set at Flink processing time, not Kafka produce time |
+| Q3 — `total_rows` | **2,145,583** | — | Matches Fluss PK table (deduped on event_id); ClickHouse had ~2.6M (may double-count via parallel consumers) |
+
+**Key observations:**
+
+- **Query speed vs Flink:** StarRocks answered Q2 in ~14s vs ~132s for Flink P3 on a similar (though smaller) dataset — roughly 10× faster for the same Parquet scan.
+- **docker exec overhead:** Negligible — measured separately, the TCP connection to MySQL and `docker exec` startup together are <1s; the 14s is genuine StarRocks execution time.
+- **Q1 returning 0 rows:** Expected and correct — all 2.1M rows have `event_time` > 1 hour in the past. Q1 is only useful in live scenarios.
+- **Pipeline lag artifact:** The 63-minute `pipeline_lag_ms` is misleading — it reflects the gap between original Kafka produce time and Flink's processing time during backfill (Flink consumed historical Kafka offsets at the time `make flink-submit` was run, not when the events were originally produced). In a steady-state system with `earliest-offset` configured, `pipeline_lag_ms` stabilizes at ~0–5s once the backlog is drained.
+- **Row count difference (P4 vs P1):** P4 has ~430K fewer rows than ClickHouse. Fluss Primary Key table deduplicates on `event_id` (exactly-once); ClickHouse Kafka Engine may process messages multiple times via parallel consumer threads.
+
 ---
 
 ## Pattern 5 — StarRocks via Flink Streaming Write (Near-Real-Time OLAP)
