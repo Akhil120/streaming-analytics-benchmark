@@ -5,7 +5,7 @@
 -- What this does:
 --   1. Creates a Fluss catalog pointing at our CoordinatorServer
 --   2. Creates analytics.transactions table in Fluss with Union Read enabled
---      (hot layer: Arrow/RAM, cold layer: Parquet in MinIO, auto-tiered every 30s)
+--      (hot layer: Arrow/RAM, cold layer: Parquet in MinIO, tiered every 2m)
 --   3. Creates a Kafka source table (in the default catalog, ephemeral)
 --   4. Submits a continuous streaming INSERT: Kafka → Fluss
 
@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS kafka_transactions (
     'topic'                         = 'transactions',
     'properties.bootstrap.servers'  = 'broker:29092',
     'properties.group.id'           = 'flink-fluss-consumer',
-    'scan.startup.mode'             = 'latest-offset',
+    'scan.startup.mode'             = 'earliest-offset',
     'format'                        = 'json',
     'json.fail-on-missing-field'    = 'false',
     'json.ignore-parse-errors'      = 'true'
