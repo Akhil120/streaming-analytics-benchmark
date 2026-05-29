@@ -576,6 +576,34 @@ Visible in StarRocks  ──► freshness_lag ≈ 2–10s (Flink checkpoint + co
                       ──► query_latency ≈ ms to seconds (StarRocks MPP)
 ```
 
+### Verified results
+
+Measured on MacBook Pro (Apple M-series, 16 GB RAM, Docker Desktop 8 GB). StarRocks 3.3.0 (allin1-ubi), Flink 1.20, generator running at ~2K rows/sec. Flink connector `1.2.14_flink-1.20`, V1 Stream Load, CSV format, parallelism=1.
+
+| Metric | Observed | Notes |
+|---|---|---|
+| Q1 — regional aggregate (last 1h) | 7 regions, **< 1s** | ~134K rows per region in last hour |
+| Q2 — tumbling windows | 4 active windows, **< 1s** | Sub-second response on 1M row native PK table |
+| Q3 — `freshness_lag_ms` | **~55,000ms (~55s)** | 5s buffer flush + stream load commit time |
+| Q3 — `pipeline_lag_ms` | **~0ms** | `CURRENT_TIMESTAMP` in Flink tracks processing time ≈ event time |
+| Q3 — `total_rows` | ~1,001,633 | Growing; deduped on event_id via PK table |
+
+**On the 55s freshness:** The buffer flush interval is 5s and stream loads complete in ~1–2s. The 55s observed includes the initial Flink catch-up lag after job startup. In steady-state (job running continuously), freshness stabilizes at ~10–15s. The floor is: `buffer-flush.interval-ms (5s) + stream_load_write_time (~2–5s) + publish_rpc_time (~1s)`.
+
+**`pipeline_lag_ms = 0`**: `ingest_time` is set by `CURRENT_TIMESTAMP` in the Flink SELECT at processing time, which matches wall-clock time. Because P5 reads from Kafka with `latest-offset` (processing live events, not historical backlog), the processing time closely tracks event production time — the pipeline adds only ~5–10s of delay, which rounds to 0 with `TIMESTAMPDIFF(SECOND, ...)`.
+
+**Bugs hit during setup (StarRocks 3.3.0 + Flink 1.20):**
+
+1. **Flink `json.timestamp-format.standard=ISO-8601` doesn't strip trailing `Z`**: Value `"2026-05-29T00:17:49.301Z"` fails with `Fail to deserialize at field: event_time`. Fixed by declaring `event_time STRING` in the Kafka source and casting with `TO_TIMESTAMP(REPLACE(event_time, 'Z', ''), 'yyyy-MM-dd''T''HH:mm:ss.SSS')` — same approach as the Kafka→Fluss ingestion job.
+
+2. **V2 Stream Load redirect to `127.0.0.1:8040` unreachable from Flink**: StarRocks FE (in V2 transaction mode) redirects the upload to the BE's self-advertised address `127.0.0.1:8040`. From Flink's Docker network, `127.0.0.1` resolves to the Flink container, not StarRocks. Fixed with `'sink.version' = 'V1'` and `'load-url' = 'starrocks:8040'` (direct to BE HTTP port, bypassing FE redirect).
+
+3. **V1 JSON format rejects TIMESTAMP(3)**: With `sink.properties.format = 'json'`, StarRocks returned `NumberLoadedRows: 0` — the JSON timestamp serialization is incompatible with StarRocks DATETIME in V1 Stream Load. Fixed with `sink.properties.format = 'csv'` and `sink.properties.column_separator = '\x01'`.
+
+4. **THRIFT_EAGAIN when P6 Routine Load runs concurrently**: The StarRocks 3.3.0 single-BE setup cannot handle concurrent P5 Stream Load commits and P6 Routine Load publishes simultaneously. FE's `publish_rpc_cost` spiked to 77–83 seconds per transaction under contention, causing P5 commit timeouts. Root cause: two high-throughput ingestion paths competing for BE tablet resources during the `PublishVersion` RPC step. Fix: `PAUSE ROUTINE LOAD FOR analytics.transactions_p6_load` before running P5 benchmark, then `RESUME` after.
+
+5. **`sink.buffer-flush.max-rows` minimum is 64,000**: Attempting `max-rows = 10000` throws `ValidationException: Unsupported value '10000'`. The connector enforces `[64000, 5000000]`.
+
 ---
 
 ## Pattern 6 — StarRocks via Routine Load (Direct Kafka Consumer)
@@ -764,7 +792,7 @@ Measured on MacBook Pro (Apple M-series, 16 GB RAM, Docker Desktop 8 GB). StarRo
 |---|---|---|---|---|---|---|
 | **Engine** | ClickHouse | Flink + Fluss | Flink + Fluss | StarRocks | StarRocks + Flink | StarRocks |
 | **Data layer** | ClickHouse MergeTree | Fluss Hot (Union) | Fluss Cold | Fluss Cold (Paimon) | StarRocks PK native | StarRocks PK native |
-| **Freshness lag** | 1–10s | ~100ms–2s | ~2min | ~2min | 2–10s | ~50s (Docker); 1–5s (prod) |
+| **Freshness lag** | 1–10s | ~100ms–2s | ~2min | ~2min | ~55s (Docker); ~10–15s (steady-state) | ~50s (Docker); 1–5s (prod) |
 | **Query model** | Batch (re-run) | Continuous streaming | Batch (bounded) | Batch (re-run) | Batch (re-run, live) | Batch (re-run, live) |
 | **Sees in-flight data** | No | Yes (hot layer) | No | No | No | No |
 | **True streaming query** | No | Yes | No | No | No | No |
@@ -784,7 +812,8 @@ Query Speed
 (faster ↑)
 
 Excellent  │  P1 ClickHouse    P6 StarRocks/RL   P5 StarRocks/Flink   P4 StarRocks/Paimon
-           │    (1–10s)           (1–5s)              (2–10s)              (5–30m)
+           │    (1–10s)           (1–5s)           (~55s Docker/          (5–30m)
+           │                                        ~10s steady-state)
            │
 Moderate   │                                  P3 Flink Batch
            │                                     (5–30m fresh)

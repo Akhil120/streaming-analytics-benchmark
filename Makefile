@@ -7,9 +7,10 @@ SQL_GATEWAY := http://localhost:8083
         ch ch-query ch-ingestion ch-freshness ch-lag \
         check-clocks \
         flink flink-jobs flink-logs flink-sql flink-submit flink-cancel \
-        flink-p2 flink-p3 \
+        flink-p2 flink-p3 flink-submit-p5 \
         minio \
         sr sr-query sr-init sr-p4 sr-freshness \
+        sr-p5-init sr-p5 sr-p5-freshness \
         sr-p6-init sr-p6-status sr-p6 sr-p6-freshness \
         ui grafana prometheus smoke-test
 
@@ -148,6 +149,12 @@ flink-submit-sql:
 # Submit both jobs: tiering JAR + SQL ingestion (cancel existing jobs first)
 flink-submit: flink-submit-tiering flink-submit-sql
 
+# Submit P5 Flink job: Fluss hot layer → StarRocks PK table (streaming write)
+# Run make sr-p5-init first to create the StarRocks target table.
+flink-submit-p5:
+	docker compose exec -T flink-jobmanager bash -c \
+	    'cat /sql/02_fluss_to_starrocks.sql | /opt/flink/bin/sql-client.sh -e http://localhost:8083'
+
 # Open MinIO console (cold storage for Fluss datalake tier)
 minio:
 	open http://localhost:9001
@@ -172,6 +179,28 @@ sr-init:
 sr-p4:
 	docker compose exec -T starrocks mysql -h 127.0.0.1 -P 9030 -u root \
 	    < docker/starrocks/queries/benchmark_p4.sql
+
+# ── StarRocks (Phase 4 — P5: Flink stream write) ─────────────────────────────
+
+# Create StarRocks target table for P5 (run once, before flink-submit-p5)
+sr-p5-init:
+	docker compose exec -T starrocks mysql -h 127.0.0.1 -P 9030 -u root \
+	    < docker/starrocks/init/03_p5_table.sql
+	@echo "StarRocks transactions_p5 table created."
+
+# Run P5 benchmark queries (Q1/Q2/Q3 on Flink-fed native PK table)
+sr-p5:
+	docker compose exec -T starrocks mysql -h 127.0.0.1 -P 9030 -u root \
+	    < docker/starrocks/queries/benchmark_p5.sql
+
+# Q3 freshness probe on P5 table
+sr-p5-freshness:
+	docker compose exec starrocks mysql -h 127.0.0.1 -P 9030 -u root -e \
+	    "SELECT MAX(event_time) AS newest_event_time, NOW() AS query_time, \
+	     TIMESTAMPDIFF(SECOND, MAX(event_time), NOW()) * 1000 AS freshness_lag_ms, \
+	     TIMESTAMPDIFF(SECOND, MAX(event_time), MAX(ingest_time)) * 1000 AS pipeline_lag_ms, \
+	     COUNT(*) AS total_rows \
+	     FROM analytics.transactions_p5"
 
 # ── StarRocks (Phase 4 — P6: Routine Load) ───────────────────────────────────
 

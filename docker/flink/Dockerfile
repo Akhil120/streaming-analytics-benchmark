@@ -26,6 +26,10 @@ RUN wget -q -O /opt/flink/lib/hadoop-client-api-3.3.5.jar \
 RUN wget -q -O /opt/flink/lib/flink-sql-connector-kafka-3.4.0-1.20.jar \
     https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.4.0-1.20/flink-sql-connector-kafka-3.4.0-1.20.jar
 
+# Add StarRocks Flink connector for P5 (Fluss hot layer → StarRocks streaming write)
+RUN wget -q -O /opt/flink/lib/flink-connector-starrocks-1.2.14_flink-1.20.jar \
+    https://repo1.maven.org/maven2/com/starrocks/flink-connector-starrocks/1.2.14_flink-1.20/flink-connector-starrocks-1.2.14_flink-1.20.jar
+
 # Bake SQL files into the image so they're available in all Flink containers
 COPY sql/ /sql/
 
