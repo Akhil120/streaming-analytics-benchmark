@@ -12,6 +12,8 @@ SQL_GATEWAY := http://localhost:8083
         sr sr-query sr-init sr-p4 sr-freshness \
         sr-p5-init sr-p5 sr-p5-freshness \
         sr-p6-init sr-p6-status sr-p6 sr-p6-freshness \
+        stream-init stream-flink-submit stream-cancel \
+        stream-sr-status stream-ch-status stream-probe-logs \
         ui grafana prometheus smoke-test
 
 # Start all Phase 1 services
@@ -237,6 +239,46 @@ sr-freshness:
 	     TIMESTAMPDIFF(SECOND, MAX(event_time), MAX(ingest_time)) * 1000 AS pipeline_lag_ms, \
 	     COUNT(*) AS total_rows \
 	     FROM paimon_catalog.analytics.transactions"
+
+# ── Streaming benchmark (benchmark 2) ────────────────────────────────────────
+#
+# Prerequisite order:
+#   1. make flink-cancel          — free task slots (streaming benchmark needs ~6)
+#   2. make sr-query Q="PAUSE ROUTINE LOAD FOR analytics.transactions_p6_load"
+#                                 — avoid concurrent ingestion contention on single BE
+#   3. make stream-init           — create transactions_s table + start Routine Load
+#   4. make stream-flink-submit   — submit all 3 streaming queries as one Flink job
+#   5. Wait ~60s for steady state, then watch probe metrics in Grafana
+
+# Create StarRocks transactions_s table + start tuned Routine Load (run once)
+stream-init:
+	docker compose exec -T starrocks mysql -h 127.0.0.1 -P 9030 -u root \
+	    < docker/starrocks/init/04_streaming_benchmark.sql
+	@echo "StarRocks transactions_s table + Routine Load created."
+
+# Submit Flink streaming benchmark job (Q-A, Q-B, Q-C as single STATEMENT SET)
+stream-flink-submit:
+	docker compose exec -T flink-jobmanager bash -c \
+	    'cat /sql/06_streaming_benchmark.sql | /opt/flink/bin/sql-client.sh -e http://localhost:8083'
+
+# Cancel the Flink streaming benchmark job (and all other running jobs)
+stream-cancel: flink-cancel
+
+# Show StarRocks Routine Load status for streaming benchmark
+stream-sr-status:
+	docker compose exec starrocks mysql -h 127.0.0.1 -P 9030 -u root -e \
+	    "SHOW ROUTINE LOAD FOR analytics.transactions_s_load\G"
+
+# Show ClickHouse streaming Kafka consumer status
+stream-ch-status:
+	docker compose exec clickhouse clickhouse-client --query \
+	    "SELECT consumer_id, num_messages_read, exceptions.text \
+	     FROM system.kafka_consumers WHERE database='analytics' \
+	     AND consumer_id LIKE '%ch-streaming%' FORMAT Vertical"
+
+# Follow probe container logs
+stream-probe-logs:
+	docker compose logs -f probe
 
 # ── Clock skew verification ───────────────────────────────────────────────────
 # All containers must agree on UTC wall-clock to within ~5ms for accurate

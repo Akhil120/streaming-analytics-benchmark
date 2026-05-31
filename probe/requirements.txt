@@ -1,0 +1,4 @@
+confluent-kafka==2.6.1
+clickhouse-connect==0.8.14
+PyMySQL==1.1.1
+prometheus-client==0.21.1

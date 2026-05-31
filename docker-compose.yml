@@ -102,6 +102,16 @@ services:
           --replication-factor 1 \
           --config retention.ms=86400000 \
           --config segment.bytes=536870912
+        for topic in flink_result_qa flink_result_qb flink_result_qc; do
+          kafka-topics --create --if-not-exists \
+            --bootstrap-server broker:29092 \
+            --topic $$topic \
+            --partitions 4 \
+            --replication-factor 1 \
+            --config cleanup.policy=compact \
+            --config min.cleanable.dirty.ratio=0.1 \
+            --config segment.ms=10000
+        done
         kafka-topics --describe --bootstrap-server broker:29092 --topic transactions
     restart: "no"
 
@@ -227,8 +237,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '2.0'
-          memory: 2G
+          cpus: '4.0'
+          memory: 4G
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
       interval: 10s
@@ -506,7 +516,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '2.0'
+          cpus: '4.0'
           memory: 4G
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9030/ 2>/dev/null; mysql -h 127.0.0.1 -P 9030 -u root --connect-timeout=3 -e 'SELECT 1' >/dev/null 2>&1 || exit 1"]
@@ -552,7 +562,38 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '2.0'
+          cpus: '4.0'
           memory: 4G
+    restart: unless-stopped
+
+  # ── Streaming benchmark probe ─────────────────────────────────────────────────
+
+  probe:
+    build:
+      context: ./probe
+      dockerfile: Dockerfile
+    container_name: probe
+    networks: [analytics]
+    ports:
+      - "8000:8000"
+    environment:
+      TZ: UTC
+      KAFKA_BROKERS: broker:29092
+      CH_HOST: clickhouse
+      SR_HOST: starrocks
+      PROBE_PORT: "8000"
+      PROBE_INTERVAL_S: "0.5"
+    depends_on:
+      broker:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      starrocks:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
     restart: unless-stopped
 
